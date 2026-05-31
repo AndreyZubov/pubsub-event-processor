@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if ! git diff --cached --name-only --diff-filter=ACM | grep -qE '\.go$|^go\.(mod|sum)$|\.golangci\.yml$'; then
+    exit 0
+fi
+
+echo "==> golangci-lint"
+make lint
+
+echo "==> go test"
+make test
