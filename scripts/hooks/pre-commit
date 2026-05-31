@@ -5,6 +5,11 @@ if ! git diff --cached --name-only --diff-filter=ACM | grep -qE '\.go$|^go\.(mod
     exit 0
 fi
 
+if ! git ls-files '*.go' | grep -q .; then
+    echo "no .go files in repo yet; skipping lint/test"
+    exit 0
+fi
+
 echo "==> golangci-lint"
 make lint
 
