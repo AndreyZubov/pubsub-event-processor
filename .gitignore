@@ -26,7 +26,7 @@ Thumbs.db
 vendor/
 
 # Internal working docs (specs, plans, notes — not for public repo)
-internal-docs/
+docs/internal/
 
 # Claude Code local memory (personal, not for public repo)
 CLAUDE.local.md

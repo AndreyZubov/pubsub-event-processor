@@ -66,9 +66,17 @@ tidy: ## Run go mod tidy
 	$(GO) mod tidy
 
 .PHONY: proto
-proto: ## Generate Go code from .proto files (configured in step 2.1)
-	@echo "proto generation will be wired up in step 2.1 when the .proto file is added"
-	@exit 1
+proto: ## Generate Go code from .proto files (Docker-based)
+	./scripts/gen_proto.sh
+
+.PHONY: proto-check
+proto-check: ## Regenerate and fail if generated code differs from committed (CI guard)
+	./scripts/gen_proto.sh
+	@if ! git diff --quiet -- proto/; then \
+	  echo "generated proto code differs from committed code; run make proto and commit"; \
+	  git --no-pager diff --stat -- proto/; \
+	  exit 1; \
+	fi
 
 .PHONY: migrate-up
 migrate-up: ## Apply all pending migrations
