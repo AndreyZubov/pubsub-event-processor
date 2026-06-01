@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
 
 	"github.com/AndreyZubov/pubsub-event-processor/internal/app"
@@ -42,7 +43,13 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	a := app.New(cfg, logger)
+	a, err := app.New(cfg, logger, prometheus.DefaultRegisterer)
+	if err != nil {
+		logger.Error("app init failed", zap.Error(err))
+		return err
+	}
+	defer func() { _ = a.Close() }()
+
 	if err := a.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		logger.Error("app failed", zap.Error(err))
 		return err

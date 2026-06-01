@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
 
 	"github.com/AndreyZubov/pubsub-event-processor/internal/config"
@@ -29,7 +30,11 @@ func testConfig() *config.Config {
 }
 
 func TestApp_RunStopsCleanly(t *testing.T) {
-	a := New(testConfig(), zap.NewNop())
+	a, err := New(testConfig(), zap.NewNop(), prometheus.NewRegistry())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { _ = a.Close() })
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
