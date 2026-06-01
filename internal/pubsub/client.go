@@ -97,6 +97,13 @@ func (c *Client) GetTopic(ctx context.Context, name string) (*salesforcepb.Topic
 	return info, nil
 }
 
+// Subscribe opens the bidirectional Subscribe stream. The caller drives
+// flow control by sending FetchRequest messages and reads ConsumerEvents
+// via the returned stream.
+func (c *Client) Subscribe(ctx context.Context) (salesforcepb.PubSub_SubscribeClient, error) {
+	return c.grpc.Subscribe(ctx)
+}
+
 // GetSchema returns the Avro schema for the given schema ID. Returns
 // ErrSchemaNotFound (wrapped) if the schema is unknown.
 func (c *Client) GetSchema(ctx context.Context, schemaID string) (*salesforcepb.SchemaInfo, error) {
