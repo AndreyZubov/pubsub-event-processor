@@ -46,9 +46,13 @@ What works today (in `make run`):
 - **gRPC client** to `api.pubsub.salesforce.com` with TLS 1.2+, HTTP/2 keepalive, per-RPC credentials that inject the three required Salesforce metadata headers (`accesstoken`, `instanceurl`, `tenantid`) automatically.
 - **Unary interceptor** that adds Prometheus metrics, structured logging, and exponential-backoff retries with jitter on transient `UNAVAILABLE` / `DEADLINE_EXCEEDED` errors.
 - **Typed wrappers** for `GetTopic` and `GetSchema` with sentinel errors for `NotFound`.
+- **Bidirectional subscribe stream** — per-topic Subscriber opens a Pub/Sub `Subscribe` stream, drives pull-based flow control via `FetchRequest`, reconnects with exponential backoff and jitter on stream errors, and recovers replay capacity through downstream acknowledgements.
+- **Avro schema cache** — fetched schemas are parsed once and reused; concurrent cold-start lookups for the same `schema_id` are deduplicated via `singleflight`.
+- **Avro decoder** — payload bytes are decoded into a generic `map[string]any` keyed by field name, ready for storage and downstream sinks.
+- **End-to-end event pipeline** — subscribers fan-in into a single events channel that a consumer goroutine drains, decoding each event and emitting a structured log line per event.
 - **Admin HTTP server** exposing `/healthz`, `/readyz` (aggregates per-subsystem checks), and `/metrics`.
-- **Startup topic discovery** — for each configured topic, the service queries Salesforce for its metadata and Avro schema and logs the result. This is the integration smoke test.
-- **Graceful shutdown** on `SIGINT` / `SIGTERM` with bounded drain timeouts.
+- **Startup topic discovery** — for each configured topic, the service queries Salesforce for its metadata and Avro schema and logs the result.
+- **Graceful shutdown** on `SIGINT` / `SIGTERM` with bounded drain timeouts coordinated through `errgroup`.
 
 Not yet implemented (see [Roadmap](#roadmap)).
 
@@ -138,7 +142,7 @@ Stop with `Ctrl+C` for a graceful shutdown.
 |-----------|-------|--------|
 | 1 — Skeleton | Config, logging, health endpoints, Docker, base lifecycle | Done |
 | 2 — Auth + gRPC | OAuth token provider, gRPC client, GetTopic / GetSchema, readiness probe | Done |
-| 3 — Subscribe + decode | Subscribe stream client, Avro schema cache, Avro decoder | Planned |
+| 3 — Subscribe + decode | Subscribe stream client, Avro schema cache, Avro decoder | Done |
 | 4 — Process + persist | Worker pool, Postgres writes, idempotency on event UUID | Planned |
 | 5 — Reliability | Replay ID persistence, reconnect with resume, graceful drain | Planned |
 | 6 — Sink + observability | Webhook sink with retries, full metrics dashboard | Planned |
@@ -154,10 +158,12 @@ internal/
   app/                     subsystem wiring and lifecycle
   auth/                    OAuth token provider with cache
   config/                  env-based configuration loader
+  event/                   shared decoded-event model
   health/                  Checker interface, /healthz, /readyz
   httpserver/              chi-based admin HTTP server
   log/                     zap logger constructor
-  pubsub/                  Salesforce Pub/Sub gRPC client wrapper
+  pubsub/                  Salesforce Pub/Sub gRPC client and Subscriber
+  schema/                  Avro schema cache and decoder
 proto/salesforce/          Salesforce .proto and generated Go code
 scripts/                   dev scripts (proto generation, git hooks)
 deploy/docker/             docker-compose, service Dockerfile
@@ -220,6 +226,11 @@ Prometheus metrics exposed at `/metrics` (Go runtime metrics included by default
 | `pubsub_grpc_rpc_total` | counter | `method`, `code` |
 | `pubsub_grpc_rpc_duration_seconds` | histogram | `method` |
 | `pubsub_grpc_rpc_retries_total` | counter | `method`, `code` |
+| `pubsub_events_received_total` | counter | `topic` |
+| `pubsub_reconnects_total` | counter | `topic`, `reason` |
+| `pubsub_stream_open` | gauge | `topic` |
+| `schema_cache_hits_total` | counter | |
+| `schema_cache_misses_total` | counter | |
 
 Structured JSON logs via zap, written to stdout. Every log line includes the `service` and `version` fields (the version is injected at build time from `git describe`).
 

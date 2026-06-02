@@ -78,6 +78,9 @@ func clampToInt32(n int64) int64 {
 // Run exits.
 func (s *Subscriber) Out() <-chan RawEvent { return s.out }
 
+// Topic returns the Salesforce topic this subscriber is bound to.
+func (s *Subscriber) Topic() string { return s.topic }
+
 // Ack signals that n events have been processed downstream and the subscriber
 // should request n more from the server. Calls coalesce until the sender wakes.
 func (s *Subscriber) Ack(n int) {
