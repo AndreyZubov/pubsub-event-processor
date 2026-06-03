@@ -8,7 +8,7 @@
 
 ## Why this project
 
-The Salesforce Pub/Sub API is a modern gRPC + HTTP/2 service that uses Avro for payload serialization. Building an event-driven ingestion service around it exercises the skills production Go backends are evaluated on: gRPC streaming clients, bounded worker pools with backpressure, at-least-once delivery semantics, schema-aware decoding, and a clean observability story.
+The Salesforce Pub/Sub API is a modern gRPC + HTTP/2 service that uses Avro for payload serialization. 
 
 The service connects to a Salesforce org as an OAuth client, subscribes to one or more Platform Event topics, decodes events, and pushes them downstream.
 
@@ -64,17 +64,26 @@ Not yet implemented (see [Roadmap](#roadmap)).
 
 - Go 1.24 or newer (the project currently builds against Go 1.26).
 - Docker (used for golangci-lint, proto generation, golang-migrate, and the local Postgres container).
-- A Salesforce Developer Edition org (or sandbox) with a Connected App configured for the OAuth Client Credentials flow.
+- A Salesforce Developer Edition org (or sandbox) with an External Client App configured for the OAuth Client Credentials flow.
 
-### Configure a Salesforce Connected App
+### Configure a Salesforce External Client App
 
-1. **Setup → App Manager → New Connected App**.
-2. Enable OAuth Settings.
-3. Set any callback URL (the value is unused for client credentials but the field is required).
-4. Select OAuth Scopes: `api`, `refresh_token`, `offline_access`.
-5. Enable **Client Credentials Flow** and choose a **Run As** user (the API will execute under that user's profile and permissions).
-6. Save. Wait ~10 minutes for the new credentials to propagate.
-7. **View → Consumer Details** and copy the **Consumer Key** and **Consumer Secret**.
+External Client Apps replace the legacy Connected Apps for new integrations.
+
+1. **Setup → External Client App Manager → New External Client App**.
+2. Fill in the basic information (name, contact email, distribution state = `Local`).
+3. In **API (Enable OAuth Settings)**:
+   - Enable OAuth.
+   - Set any callback URL such as `http://localhost/oauth/callback` (unused for client credentials but required).
+   - Select OAuth scopes: `api`, `refresh_token`, `offline_access`.
+4. Save the app.
+5. Open the new app and go to the **Policies** tab → **Edit**:
+   - Enable **Client Credentials Flow**.
+   - Choose a **Run As** user — the API will execute under that user's profile and permissions.
+6. Save. Wait a few minutes for the new credentials to propagate.
+7. Open the **Settings** tab → **Consumer Key and Secret** → reveal and copy:
+   - **Consumer Key** → `SF_CLIENT_ID`
+   - **Consumer Secret** → `SF_CLIENT_SECRET`
 8. Optionally, create a Platform Event (Setup → Platform Events → New) to subscribe to, for example `Order_Event` (the API name becomes `/event/Order_Event__e`).
 
 ### Configure the service
@@ -238,7 +247,7 @@ Structured JSON logs via zap, written to stdout. Every log line includes the `se
 
 ## License
 
-TBD.
+Released under the [MIT License](LICENSE). You are free to use, modify, and distribute this code in both open-source and commercial work; the only obligation is to keep the copyright notice in any substantial copy.
 
 ---
 
