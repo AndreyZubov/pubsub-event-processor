@@ -15,6 +15,7 @@ import (
 	"github.com/AndreyZubov/pubsub-event-processor/internal/app"
 	"github.com/AndreyZubov/pubsub-event-processor/internal/config"
 	applog "github.com/AndreyZubov/pubsub-event-processor/internal/log"
+	"github.com/AndreyZubov/pubsub-event-processor/internal/storage"
 )
 
 // version is injected at build time via -ldflags "-X main.version=...".
@@ -39,6 +40,11 @@ func run() error {
 		return err
 	}
 	defer func() { _ = logger.Sync() }()
+
+	if err := storage.Migrate(cfg.Database.URL, logger); err != nil {
+		logger.Error("migrate", zap.Error(err))
+		return err
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()

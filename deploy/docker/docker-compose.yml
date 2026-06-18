@@ -9,7 +9,9 @@ services:
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: pubsub
     ports:
-      - "5432:5432"
+      # Bound to localhost only and on 5433 to avoid colliding with a host
+      # Postgres on the default 5432 port.
+      - "127.0.0.1:5433:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:

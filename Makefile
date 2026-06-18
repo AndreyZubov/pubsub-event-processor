@@ -14,7 +14,7 @@ GOLANGCI_LINT_VERSION := v2.12.2
 MIGRATE_IMAGE := migrate/migrate:v4.18.1
 COMPOSE_FILE := deploy/docker/docker-compose.yml
 
-DATABASE_URL ?= postgres://postgres:postgres@localhost:5432/pubsub?sslmode=disable
+DATABASE_URL ?= postgres://postgres:postgres@localhost:5433/pubsub?sslmode=disable
 MIGRATIONS_DIR := migrations
 
 HAS_GOLANGCI_LINT := $(shell command -v golangci-lint 2> /dev/null)
