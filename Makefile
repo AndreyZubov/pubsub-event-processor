@@ -35,8 +35,12 @@ run: build ## Build and run the processor locally
 	./$(BIN)
 
 .PHONY: test
-test: ## Run all tests with race detector
+test: ## Run unit tests with race detector
 	$(GO) test -race -count=1 $(PKG)
+
+.PHONY: integration-test
+integration-test: ## Run integration tests (requires Docker; uses testcontainers)
+	$(GO) test -race -count=1 -tags=integration -timeout=5m ./internal/storage/...
 
 .PHONY: cover
 cover: ## Run tests with coverage, write coverage.out and coverage.html

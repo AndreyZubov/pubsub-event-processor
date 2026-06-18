@@ -34,9 +34,10 @@ type PubSubConfig struct {
 	Topics   []string `env:"SF_TOPICS,required"   envSeparator:","`
 }
 
-// DatabaseConfig holds the Postgres connection DSN.
+// DatabaseConfig holds the Postgres connection DSN and pool sizing.
 type DatabaseConfig struct {
-	URL string `env:"DATABASE_URL,required"`
+	URL      string `env:"DATABASE_URL,required"`
+	MaxConns int    `env:"DATABASE_MAX_CONNS" envDefault:"20"`
 }
 
 // SinkConfig holds optional downstream sink settings.
@@ -76,6 +77,9 @@ func (c *Config) Validate() error {
 	}
 	if c.Worker.FlowBatchSize < 1 {
 		errs = append(errs, fmt.Errorf("FLOW_BATCH_SIZE must be >= 1, got %d", c.Worker.FlowBatchSize))
+	}
+	if c.Database.MaxConns < 1 || c.Database.MaxConns > 1000 {
+		errs = append(errs, fmt.Errorf("DATABASE_MAX_CONNS must be in 1..1000, got %d", c.Database.MaxConns))
 	}
 
 	if len(c.PubSub.Topics) == 0 {
