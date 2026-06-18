@@ -22,7 +22,7 @@ func testConfig() *config.Config {
 			Endpoint: "api.pubsub.salesforce.com:7443",
 			Topics:   []string{"/event/Test__e"},
 		},
-		Database: config.DatabaseConfig{URL: "postgres://x@y/z"},
+		Database: config.DatabaseConfig{URL: "postgres://x@y/z", MaxConns: 20},
 		HTTP:     config.HTTPConfig{Addr: "127.0.0.1:0"},
 		Worker:   config.WorkerConfig{Count: 8, FlowBatchSize: 100},
 		LogLevel: "info",

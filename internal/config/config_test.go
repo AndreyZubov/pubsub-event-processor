@@ -9,7 +9,7 @@ import (
 var allConfigEnvKeys = []string{
 	"SF_CLIENT_ID", "SF_CLIENT_SECRET", "SF_LOGIN_URL",
 	"SF_TOPICS", "PUBSUB_ENDPOINT",
-	"DATABASE_URL", "SINK_WEBHOOK_URL",
+	"DATABASE_URL", "DATABASE_MAX_CONNS", "SINK_WEBHOOK_URL",
 	"WORKER_COUNT", "FLOW_BATCH_SIZE",
 	"HTTP_ADDR", "LOG_LEVEL",
 }
@@ -75,6 +75,9 @@ func TestLoad_HappyPathDefaults(t *testing.T) {
 	}
 	if cfg.Worker.FlowBatchSize != 100 {
 		t.Errorf("FlowBatchSize default: got %d", cfg.Worker.FlowBatchSize)
+	}
+	if cfg.Database.MaxConns != 20 {
+		t.Errorf("MaxConns default: got %d", cfg.Database.MaxConns)
 	}
 	if cfg.HTTP.Addr != ":8080" {
 		t.Errorf("HTTP.Addr default: got %q", cfg.HTTP.Addr)
@@ -194,6 +197,16 @@ func TestLoad_Errors(t *testing.T) {
 			name:    "bad SINK_WEBHOOK_URL",
 			env:     map[string]string{"SINK_WEBHOOK_URL": "://broken"},
 			wantErr: "SINK_WEBHOOK_URL",
+		},
+		{
+			name:    "DATABASE_MAX_CONNS too low",
+			env:     map[string]string{"DATABASE_MAX_CONNS": "0"},
+			wantErr: "DATABASE_MAX_CONNS",
+		},
+		{
+			name:    "DATABASE_MAX_CONNS too high",
+			env:     map[string]string{"DATABASE_MAX_CONNS": "2000"},
+			wantErr: "DATABASE_MAX_CONNS",
 		},
 	}
 
