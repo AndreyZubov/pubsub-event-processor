@@ -14,6 +14,14 @@ data:
   FLOW_BATCH_SIZE: {{ .Values.config.flowBatchSize | quote }}
   DATABASE_MAX_CONNS: {{ .Values.config.databaseMaxConns | quote }}
   SINK_WEBHOOK_URL: {{ .Values.config.sinkWebhookUrl | quote }}
+  REDIS_ENABLED: {{ .Values.redis.enabled | quote }}
+{{- if .Values.redis.enabled }}
+  REDIS_ADDR: {{ include "processor.redisAddr" . | quote }}
+  REDIS_DB: {{ .Values.redis.db | quote }}
+  REDIS_KEY_PREFIX: {{ .Values.redis.keyPrefix | quote }}
+  REDIS_TTL: {{ .Values.redis.ttl | quote }}
+  REDIS_TIMEOUT: {{ .Values.redis.timeout | quote }}
+{{- end }}
   KAFKA_ENABLED: {{ .Values.kafka.enabled | quote }}
 {{- if .Values.kafka.enabled }}
   KAFKA_BROKERS: {{ required "kafka.brokers is required when kafka.enabled is true" .Values.kafka.brokers | quote }}

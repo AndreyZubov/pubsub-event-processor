@@ -65,6 +65,38 @@ config:
   # -- Optional webhook sink. Empty disables it.
   sinkWebhookUrl: ""
 
+# Deduplication cache. Optional: the service is correct without it, only slower
+# when Salesforce replays a large backlog after a reconnect. A miss — including
+# one caused by Redis being down — falls through to Postgres, which is
+# authoritative.
+redis:
+  enabled: false
+  # -- Address of an external Redis, host:port. Ignored when deployRedis is true.
+  addr: ""
+  password: ""
+  db: 0
+  keyPrefix: "pubsub:seen:"
+  # Should cover the Salesforce replay window; beyond it a duplicate can no
+  # longer arrive and the entry only occupies memory.
+  ttl: 24h
+  # Kept short: the cache must never cost more than the query it avoids.
+  timeout: 500ms
+
+  # -- Deploy a Redis instance alongside the service.
+  #
+  # For local demos and CI only, like the bundled Postgres. A cache is a poor
+  # thing to own from an application chart: it is shared infrastructure with its
+  # own lifecycle, and this one has no persistence, no replication, no eviction
+  # policy tuning.
+  deployRedis: false
+  image: redis:7-alpine
+  resources:
+    requests:
+      cpu: 25m
+      memory: 32Mi
+    limits:
+      memory: 128Mi
+
 # Kafka sink. Disabled by default so the chart deploys without a broker.
 kafka:
   enabled: false

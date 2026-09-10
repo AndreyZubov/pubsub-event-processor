@@ -48,7 +48,12 @@ test: ## Run unit tests with race detector
 
 .PHONY: integration-test
 integration-test: ## Run integration tests (requires Docker; uses testcontainers)
-	$(GO) test -race -count=1 -tags=integration -timeout=15m ./internal/storage/... ./internal/kafka/...
+	$(GO) test -race -count=1 -tags=integration -timeout=15m ./internal/storage/... ./internal/kafka/... ./internal/rediscache/...
+
+.PHONY: bench
+bench: ## Benchmark duplicate handling with and without the dedup cache
+	$(GO) test -tags=integration -bench=BenchmarkDuplicates -benchtime=2000x \
+	  -run='^$$' -timeout=15m ./internal/handler/
 
 .PHONY: cover
 cover: ## Run tests with coverage, write coverage.out and coverage.html

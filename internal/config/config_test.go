@@ -13,6 +13,8 @@ var allConfigEnvKeys = []string{
 	"DATABASE_URL", "DATABASE_MAX_CONNS", "SINK_WEBHOOK_URL",
 	"WORKER_COUNT", "FLOW_BATCH_SIZE",
 	"HTTP_ADDR", "LOG_LEVEL",
+	"REDIS_ENABLED", "REDIS_ADDR", "REDIS_PASSWORD", "REDIS_DB",
+	"REDIS_KEY_PREFIX", "REDIS_TTL", "REDIS_TIMEOUT",
 	"KAFKA_ENABLED", "KAFKA_BROKERS", "KAFKA_TOPIC", "KAFKA_CLIENT_ID",
 	"KAFKA_PRODUCE_TIMEOUT", "KAFKA_CREATE_TOPIC",
 	"KAFKA_TOPIC_PARTITIONS", "KAFKA_TOPIC_REPLICATION_FACTOR",
@@ -203,6 +205,28 @@ func TestLoad_Errors(t *testing.T) {
 			wantErr: "SINK_WEBHOOK_URL",
 		},
 		{
+			name:    "redis enabled without address",
+			env:     map[string]string{"REDIS_ENABLED": "true"},
+			wantErr: "REDIS_ADDR must be set",
+		},
+		{
+			name: "redis address without port",
+			env: map[string]string{
+				"REDIS_ENABLED": "true",
+				"REDIS_ADDR":    "redis-without-port",
+			},
+			wantErr: "REDIS_ADDR must be host:port",
+		},
+		{
+			name: "redis zero ttl",
+			env: map[string]string{
+				"REDIS_ENABLED": "true",
+				"REDIS_ADDR":    "localhost:6379",
+				"REDIS_TTL":     "0s",
+			},
+			wantErr: "REDIS_TTL must be > 0",
+		},
+		{
 			name:    "kafka enabled without brokers",
 			env:     map[string]string{"KAFKA_ENABLED": "true"},
 			wantErr: "KAFKA_BROKERS must be set",
@@ -321,5 +345,59 @@ func TestLoad_KafkaEnabled(t *testing.T) {
 	}
 	if cfg.Kafka.TopicPartitions != 6 || cfg.Kafka.TopicReplicationFactor != 3 {
 		t.Errorf("partitions/replication = %d/%d", cfg.Kafka.TopicPartitions, cfg.Kafka.TopicReplicationFactor)
+	}
+}
+
+// The cache is opt-in and must not affect a configuration that leaves it off.
+func TestLoad_RedisDisabledByDefault(t *testing.T) {
+	resetEnv(t)
+	setEnv(t, baseEnv())
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Redis.Enabled {
+		t.Error("Redis.Enabled = true, want false by default")
+	}
+
+	// No address, which would be fatal if the cache were enabled.
+	setEnv(t, map[string]string{"REDIS_ENABLED": "false"})
+	if _, err := Load(); err != nil {
+		t.Errorf("Load with Redis disabled and no address: %v", err)
+	}
+}
+
+func TestLoad_RedisEnabled(t *testing.T) {
+	resetEnv(t)
+	setEnv(t, baseEnv())
+	setEnv(t, map[string]string{
+		"REDIS_ENABLED":    "true",
+		"REDIS_ADDR":       "redis:6379",
+		"REDIS_KEY_PREFIX": "svc:seen:",
+		"REDIS_TTL":        "6h",
+		"REDIS_TIMEOUT":    "250ms",
+		"REDIS_DB":         "3",
+	})
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	if cfg.Redis.Addr != "redis:6379" {
+		t.Errorf("Addr = %q", cfg.Redis.Addr)
+	}
+	if cfg.Redis.KeyPrefix != "svc:seen:" {
+		t.Errorf("KeyPrefix = %q", cfg.Redis.KeyPrefix)
+	}
+	if cfg.Redis.TTL != 6*time.Hour {
+		t.Errorf("TTL = %s", cfg.Redis.TTL)
+	}
+	if cfg.Redis.Timeout != 250*time.Millisecond {
+		t.Errorf("Timeout = %s", cfg.Redis.Timeout)
+	}
+	if cfg.Redis.DB != 3 {
+		t.Errorf("DB = %d", cfg.Redis.DB)
 	}
 }

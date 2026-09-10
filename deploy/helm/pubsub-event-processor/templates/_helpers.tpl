@@ -65,6 +65,21 @@ Either the one this chart creates, or a pre-existing one supplied by the user.
 {{- end }}
 {{- end }}
 
+{{- define "processor.redis.fullname" -}}
+{{- printf "%s-redis" (include "processor.fullname" .) | trunc 63 | trimSuffix "-" }}
+{{- end }}
+
+{{/*
+Redis address: the bundled instance when deployed, otherwise the one supplied.
+*/}}
+{{- define "processor.redisAddr" -}}
+{{- if .Values.redis.deployRedis -}}
+{{ include "processor.redis.fullname" . }}:6379
+{{- else -}}
+{{- required "Set redis.deployRedis=true, or provide redis.addr" .Values.redis.addr -}}
+{{- end -}}
+{{- end }}
+
 {{- define "processor.postgres.fullname" -}}
 {{- printf "%s-postgres" (include "processor.fullname" .) | trunc 63 | trimSuffix "-" }}
 {{- end }}
