@@ -1,0 +1,188 @@
+# Default values for pubsub-event-processor.
+
+# -- Number of processor pods.
+#
+# Keep this at 1 unless you have partitioned the topic subscriptions.
+# The service opens a Pub/Sub Subscribe stream per configured topic; two pods
+# with the same SF_TOPICS both receive every event, so scaling out multiplies
+# processing rather than sharing it. Writes are idempotent on event UUID, so
+# duplicates are absorbed rather than corrupting data — but the work is wasted
+# and the org's event delivery allocation is consumed twice.
+#
+# This is also why no HorizontalPodAutoscaler ships with this chart: autoscaling
+# a stream consumer without partitioning is a correctness problem, not a knob.
+replicaCount: 1
+
+image:
+  repository: pubsub-event-processor
+  # -- Overrides the image tag. Defaults to .Chart.AppVersion.
+  tag: ""
+  # Use IfNotPresent so a locally built image (kind load) is not re-pulled.
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+  # The service calls no Kubernetes API, so it needs no token mounted.
+  automountServiceAccountToken: false
+
+# -- Deployment strategy.
+#
+# Recreate, not RollingUpdate: during a rolling update the old and new pods
+# would briefly both hold Subscribe streams and consume the same events. With
+# replicaCount 1 the cost of Recreate is a short gap in consumption, which the
+# replay-ID resume covers — events are not lost, only delayed.
+strategy:
+  type: Recreate
+
+# -- Seconds Kubernetes waits after SIGTERM before SIGKILL.
+# Must exceed the application's own drain budget: the admin HTTP server allows
+# 10s for shutdown, and the worker pool drains in-flight events on top of that.
+terminationGracePeriodSeconds: 30
+
+service:
+  type: ClusterIP
+  port: 8080
+  # Named so the ServiceMonitor and probes can reference it by name.
+  portName: http
+  annotations: {}
+
+# Non-secret configuration, rendered into a ConfigMap.
+config:
+  logLevel: info
+  pubsubEndpoint: api.pubsub.salesforce.com:7443
+  salesforceLoginUrl: https://login.salesforce.com
+  # -- Comma-separated Salesforce topics, e.g. "/event/Order_Event__e".
+  topics: "/event/Order_Event__e"
+  workerCount: 8
+  flowBatchSize: 100
+  databaseMaxConns: 20
+  # -- Optional webhook sink. Empty disables it.
+  sinkWebhookUrl: ""
+
+# Secret material. Prefer existingSecret in any real environment: values passed
+# here end up in the Helm release stored in the cluster.
+secrets:
+  # -- Name of a pre-existing Secret with keys SF_CLIENT_ID, SF_CLIENT_SECRET
+  # and DATABASE_URL. When set, the chart creates no Secret of its own.
+  existingSecret: ""
+  clientId: ""
+  clientSecret: ""
+  # -- Database DSN. Ignored when postgres.enabled is true.
+  databaseUrl: ""
+
+# Bundled PostgreSQL for local demos and CI. Not for production: single
+# replica, no backups, no connection pooling.
+postgres:
+  enabled: false
+  image: postgres:16-alpine
+  auth:
+    username: postgres
+    password: postgres
+    database: pubsub
+  persistence:
+    enabled: true
+    size: 1Gi
+    storageClass: ""
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      memory: 256Mi
+
+# Blocks startup until Postgres accepts connections. Without it the pod
+# crash-loops through the startup migration until the database is up — which
+# works, but produces noisy restarts.
+waitForPostgres:
+  enabled: true
+  image: postgres:16-alpine
+  pullPolicy: IfNotPresent
+  timeoutSeconds: 120
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    # No CPU limit on purpose: CFS throttling on a latency-sensitive stream
+    # consumer causes worse tail behaviour than brief bursts above the request.
+    # Memory is limited, because exceeding it should kill the pod, not the node.
+    memory: 512Mi
+
+# Liveness must not depend on Salesforce or Postgres. If it did, an upstream
+# outage would restart every pod in a loop and make recovery slower.
+# /healthz answers 200 whenever the process is alive.
+livenessProbe:
+  enabled: true
+  path: /healthz
+  initialDelaySeconds: 5
+  periodSeconds: 15
+  timeoutSeconds: 3
+  failureThreshold: 3
+
+# Readiness aggregates subsystem checks (currently the Salesforce token).
+# A failing check pulls the pod out of the Service without restarting it.
+readinessProbe:
+  enabled: true
+  path: /readyz
+  initialDelaySeconds: 5
+  periodSeconds: 10
+  timeoutSeconds: 3
+  failureThreshold: 3
+
+# Covers a slow first start (migrations, topic discovery) so a cold start is not
+# mistaken for a hung process by the liveness probe.
+startupProbe:
+  enabled: true
+  path: /healthz
+  periodSeconds: 5
+  failureThreshold: 30
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  privileged: false
+  capabilities:
+    drop:
+      - ALL
+
+podAnnotations: {}
+podLabels: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+topologySpreadConstraints: []
+
+podDisruptionBudget:
+  # Disabled by default: with a single replica a PDB requiring one available pod
+  # blocks node drains indefinitely.
+  enabled: false
+  maxUnavailable: 1
+
+networkPolicy:
+  # Restricts egress to DNS, Postgres, and Salesforce endpoints.
+  enabled: false
+  # Extra CIDRs the pod may reach on 443/7443.
+  allowedExternalCIDRs:
+    - 0.0.0.0/0
+
+# Requires the Prometheus Operator CRDs.
+serviceMonitor:
+  enabled: false
+  interval: 30s
+  scrapeTimeout: 10s
+  labels: {}

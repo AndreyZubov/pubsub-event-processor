@@ -1,0 +1,31 @@
+# Local demo values for a kind cluster.
+#
+# Credentials here are placeholders. The processor will start, pass liveness,
+# and report readiness 503 because the Salesforce OAuth check fails — which is
+# exactly what a correct readiness probe should do. Substitute real values to
+# see it go ready.
+
+image:
+  repository: pubsub-event-processor
+  tag: dev
+  pullPolicy: Never   # image is side-loaded with `kind load docker-image`
+
+postgres:
+  enabled: true
+  persistence:
+    enabled: false    # ephemeral: the demo does not need to survive a restart
+
+secrets:
+  clientId: "placeholder-client-id"
+  clientSecret: "placeholder-client-secret"
+
+config:
+  logLevel: debug
+  topics: "/event/Order_Event__e"
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    memory: 256Mi

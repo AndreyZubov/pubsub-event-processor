@@ -1,0 +1,39 @@
+{{ include "processor.fullname" . }} deployed to namespace {{ .Release.Namespace }}.
+
+Image:    {{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}
+Replicas: {{ .Values.replicaCount }}
+Topics:   {{ .Values.config.topics }}
+Database: {{ if .Values.postgres.enabled }}bundled Postgres ({{ include "processor.postgres.fullname" . }}){{ else }}external{{ end }}
+
+1. Watch the pod come up:
+
+   kubectl -n {{ .Release.Namespace }} rollout status deploy/{{ include "processor.fullname" . }}
+
+2. Reach the admin endpoints:
+
+   kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "processor.fullname" . }} {{ .Values.service.port }}:{{ .Values.service.port }}
+
+   curl localhost:{{ .Values.service.port }}/healthz   # liveness
+   curl localhost:{{ .Values.service.port }}/readyz    # readiness, with per-subsystem detail
+   curl localhost:{{ .Values.service.port }}/metrics   # Prometheus
+
+3. Verify the release:
+
+   helm test {{ .Release.Name }} -n {{ .Release.Namespace }}
+
+{{ if not .Values.secrets.existingSecret }}
+NOTE: Salesforce credentials were passed through --set or a values file, so they
+are stored in the Helm release Secret in this cluster. For anything beyond a local
+demo, create the Secret separately and set secrets.existingSecret.
+{{- end }}
+{{ if .Values.postgres.enabled }}
+NOTE: The bundled Postgres is a single replica with no backups. It exists for local
+demos and CI. Point DATABASE_URL at a managed database for real workloads.
+{{- end }}
+
+READINESS: /readyz gates on the Salesforce OAuth check. With placeholder
+credentials the pod stays Running with liveness green while readiness reports 503 —
+that is the intended behaviour, not a deployment failure. Inspect it with:
+
+   kubectl -n {{ .Release.Namespace }} get pods -l app.kubernetes.io/instance={{ .Release.Name }},app.kubernetes.io/component=processor
+   kubectl -n {{ .Release.Namespace }} logs -l app.kubernetes.io/instance={{ .Release.Name }},app.kubernetes.io/component=processor --tail=50

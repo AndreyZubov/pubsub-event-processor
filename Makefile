@@ -10,9 +10,17 @@ DOCKER ?= docker
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -ldflags "-X main.version=$(VERSION) -s -w"
 
-GOLANGCI_LINT_VERSION := v2.12.2
+GOLANGCI_LINT_VERSION := v2.13.2
 MIGRATE_IMAGE := migrate/migrate:v4.18.1
 COMPOSE_FILE := deploy/docker/docker-compose.yml
+
+CHART_DIR := deploy/helm/pubsub-event-processor
+KIND_CLUSTER ?= dev
+K8S_NAMESPACE ?= pubsub-demo
+HELM_RELEASE ?= demo
+HELM_VALUES ?= deploy/helm/values-kind.yaml
+# Label selector addressing the processor pods only, not the bundled Postgres.
+K8S_SELECTOR := app.kubernetes.io/component=processor
 
 DATABASE_URL ?= postgres://postgres:postgres@localhost:5433/pubsub?sslmode=disable
 MIGRATIONS_DIR := migrations
@@ -135,3 +143,68 @@ install-hooks: ## Install git pre-commit hook
 .PHONY: clean
 clean: ## Remove build and coverage artifacts
 	rm -rf $(BIN_DIR) coverage.out coverage.html
+
+# ---------------------------------------------------------------------------
+# Kubernetes (local kind cluster)
+# ---------------------------------------------------------------------------
+
+.PHONY: helm-lint
+helm-lint: ## Lint the Helm chart
+	helm lint $(CHART_DIR) -f $(HELM_VALUES)
+
+.PHONY: helm-template
+helm-template: ## Render the chart to stdout
+	helm template $(HELM_RELEASE) $(CHART_DIR) -f $(HELM_VALUES)
+
+.PHONY: helm-validate
+helm-validate: ## Validate rendered manifests against the live cluster API
+	helm template $(HELM_RELEASE) $(CHART_DIR) -f $(HELM_VALUES) \
+	  | kubectl apply --dry-run=server -f -
+
+.PHONY: kind-up
+kind-up: ## Create the local kind cluster if it does not exist
+	@kind get clusters 2>/dev/null | grep -qx "$(KIND_CLUSTER)" \
+	  && echo "kind cluster '$(KIND_CLUSTER)' already exists" \
+	  || kind create cluster --name $(KIND_CLUSTER)
+
+.PHONY: kind-load
+kind-load: docker-build ## Build the image and side-load it into kind
+	$(DOCKER) tag pubsub-event-processor:$(VERSION) pubsub-event-processor:dev
+	kind load docker-image pubsub-event-processor:dev --name $(KIND_CLUSTER)
+
+.PHONY: k8s-deploy
+k8s-deploy: kind-load ## Deploy the chart into the kind cluster
+	helm upgrade --install $(HELM_RELEASE) $(CHART_DIR) \
+	  -f $(HELM_VALUES) \
+	  -n $(K8S_NAMESPACE) --create-namespace
+	@echo
+	@echo "Deployed. With placeholder Salesforce credentials the pod stays Running"
+	@echo "and readiness reports 503 — that is expected. Run 'make k8s-status'."
+
+.PHONY: k8s-status
+k8s-status: ## Show pods, endpoints, and probe state
+	@echo "== pods =="
+	@kubectl -n $(K8S_NAMESPACE) get pods -L app.kubernetes.io/component
+	@echo
+	@echo "== service endpoints (empty until readiness passes) =="
+	@kubectl -n $(K8S_NAMESPACE) get endpointslice \
+	  -l kubernetes.io/service-name=$(HELM_RELEASE)-pubsub-event-processor \
+	  -o jsonpath='{range .items[*].endpoints[*]}{.addresses[0]}{"  ready="}{.conditions.ready}{"\n"}{end}'
+
+.PHONY: k8s-logs
+k8s-logs: ## Tail processor logs
+	kubectl -n $(K8S_NAMESPACE) logs -l $(K8S_SELECTOR) -c processor -f --tail=50
+
+.PHONY: k8s-forward
+k8s-forward: ## Forward the admin port to localhost:8080
+	@echo "curl localhost:8080/healthz | /readyz | /metrics"
+	kubectl -n $(K8S_NAMESPACE) port-forward svc/$(HELM_RELEASE)-pubsub-event-processor 8080:8080
+
+.PHONY: k8s-test
+k8s-test: ## Run the chart's Helm test hook (requires a ready release)
+	helm test $(HELM_RELEASE) -n $(K8S_NAMESPACE) --logs
+
+.PHONY: k8s-undeploy
+k8s-undeploy: ## Remove the release and its namespace
+	-helm uninstall $(HELM_RELEASE) -n $(K8S_NAMESPACE)
+	-kubectl delete namespace $(K8S_NAMESPACE) --wait=false

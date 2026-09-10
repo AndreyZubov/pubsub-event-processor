@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "processor.fullname" . }}
+  labels:
+    {{- include "processor.labels" . | nindent 4 }}
+data:
+  LOG_LEVEL: {{ .Values.config.logLevel | quote }}
+  HTTP_ADDR: {{ printf ":%d" (int .Values.service.port) | quote }}
+  PUBSUB_ENDPOINT: {{ .Values.config.pubsubEndpoint | quote }}
+  SF_LOGIN_URL: {{ .Values.config.salesforceLoginUrl | quote }}
+  SF_TOPICS: {{ .Values.config.topics | quote }}
+  WORKER_COUNT: {{ .Values.config.workerCount | quote }}
+  FLOW_BATCH_SIZE: {{ .Values.config.flowBatchSize | quote }}
+  DATABASE_MAX_CONNS: {{ .Values.config.databaseMaxConns | quote }}
+  SINK_WEBHOOK_URL: {{ .Values.config.sinkWebhookUrl | quote }}
