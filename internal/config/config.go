@@ -16,6 +16,7 @@ type Config struct {
 	Salesforce SalesforceConfig
 	PubSub     PubSubConfig
 	Database   DatabaseConfig
+	Redis      RedisConfig
 	Kafka      KafkaConfig
 	Sink       SinkConfig
 	HTTP       HTTPConfig
@@ -40,6 +41,27 @@ type PubSubConfig struct {
 type DatabaseConfig struct {
 	URL      string `env:"DATABASE_URL,required"`
 	MaxConns int    `env:"DATABASE_MAX_CONNS" envDefault:"20"`
+}
+
+// RedisConfig holds settings for the deduplication cache.
+//
+// The cache is an optimisation, never a source of truth: it short-circuits the
+// database transaction for events already processed in full. Disabled by
+// default — the service is correct without it, only slower on large replays.
+type RedisConfig struct {
+	Enabled bool   `env:"REDIS_ENABLED" envDefault:"false"`
+	Addr    string `env:"REDIS_ADDR"`
+	// Password is optional; empty means no AUTH.
+	Password string `env:"REDIS_PASSWORD"`
+	DB       int    `env:"REDIS_DB" envDefault:"0"`
+	// KeyPrefix namespaces this service's keys so the instance can be shared.
+	KeyPrefix string `env:"REDIS_KEY_PREFIX" envDefault:"pubsub:seen:"`
+	// TTL should cover the Salesforce replay window: beyond it a duplicate can
+	// no longer arrive, so remembering the event wastes memory.
+	TTL time.Duration `env:"REDIS_TTL" envDefault:"24h"`
+	// Timeout bounds a single cache operation. Kept short: the cache must never
+	// become slower than the database call it is avoiding.
+	Timeout time.Duration `env:"REDIS_TIMEOUT" envDefault:"500ms"`
 }
 
 // KafkaConfig holds settings for the Kafka sink. Disabled by default so the
@@ -123,6 +145,20 @@ func (c *Config) Validate() error {
 
 	if u, err := url.Parse(c.Salesforce.LoginURL); err != nil || u.Scheme == "" || u.Host == "" {
 		errs = append(errs, fmt.Errorf("SF_LOGIN_URL is not a valid absolute URL: %q", c.Salesforce.LoginURL))
+	}
+
+	if c.Redis.Enabled {
+		if c.Redis.Addr == "" {
+			errs = append(errs, errors.New("REDIS_ADDR must be set when REDIS_ENABLED is true"))
+		} else if _, _, err := net.SplitHostPort(c.Redis.Addr); err != nil {
+			errs = append(errs, fmt.Errorf("REDIS_ADDR must be host:port: %w", err))
+		}
+		if c.Redis.TTL <= 0 {
+			errs = append(errs, fmt.Errorf("REDIS_TTL must be > 0, got %s", c.Redis.TTL))
+		}
+		if c.Redis.Timeout <= 0 {
+			errs = append(errs, fmt.Errorf("REDIS_TIMEOUT must be > 0, got %s", c.Redis.Timeout))
+		}
 	}
 
 	if c.Kafka.Enabled {

@@ -1,0 +1,85 @@
+{{- if and .Values.redis.enabled .Values.redis.deployRedis }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "processor.redis.fullname" . }}
+  labels:
+    {{- include "processor.labels" . | nindent 4 }}
+    app.kubernetes.io/component: cache
+spec:
+  type: ClusterIP
+  ports:
+    - port: 6379
+      targetPort: redis
+      protocol: TCP
+      name: redis
+  selector:
+    {{- include "processor.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: cache
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "processor.redis.fullname" . }}
+  labels:
+    {{- include "processor.labels" . | nindent 4 }}
+    app.kubernetes.io/component: cache
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "processor.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: cache
+  template:
+    metadata:
+      labels:
+        {{- include "processor.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: cache
+    spec:
+      # A Deployment, not a StatefulSet: this cache holds nothing worth keeping
+      # across a restart. Losing it costs one slower replay, never correctness.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: redis
+          image: {{ .Values.redis.image }}
+          imagePullPolicy: IfNotPresent
+          args:
+            - --save
+            - ""
+            - --appendonly
+            - "no"
+            - --maxmemory-policy
+            - allkeys-lru
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          ports:
+            - name: redis
+              containerPort: 6379
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          resources:
+            {{- toYaml .Values.redis.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          emptyDir: {}
+{{- end }}

@@ -27,6 +27,8 @@ The service connects to a Salesforce org as an OAuth client, subscribes to one o
                           |
                   [ Avro decoder ] (schema cache, singleflight)
                           |
+                 ( dedup cache )   <- Redis, optional; a miss is never wrong
+                          |
                  [ Handler chain ] <- persist, then forward
                      /         \
             [ Postgres ]    [ Kafka ]
@@ -51,6 +53,7 @@ What works today (in `make run`):
 - **Avro decoder** — payload bytes are decoded into a generic `map[string]any` keyed by field name, ready for storage and downstream sinks.
 - **End-to-end event pipeline** — subscribers fan-in into a single events channel drained by a bounded worker pool, which decodes each event and runs it through a handler chain.
 - **Persistence** — decoded events are written to PostgreSQL and the topic's replay cursor advances in the same transaction. Idempotency comes from a UNIQUE constraint on the event UUID, so replay after a reconnect is a no-op rather than a duplicate.
+- **Deduplication cache** (optional, `REDIS_ENABLED`) — Redis short-circuits the database transaction for events already processed in full. A miss, including one caused by Redis being down, falls through to Postgres, which stays authoritative.
 - **Kafka sink** (optional, `KAFKA_ENABLED`) — events are published as a JSON envelope, keyed by Salesforce topic, with an idempotent producer and `acks=all`. Readiness gates on broker reachability.
 - **Admin HTTP server** exposing `/healthz`, `/readyz` (aggregates per-subsystem checks), and `/metrics`.
 - **Startup topic discovery** — for each configured topic, the service queries Salesforce for its metadata and Avro schema and logs the result.
@@ -117,6 +120,11 @@ Optional knobs:
 | `HTTP_ADDR` | `:8080` |
 | `LOG_LEVEL` | `info` |
 | `SINK_WEBHOOK_URL` | _empty_ |
+| `REDIS_ENABLED` | `false` |
+| `REDIS_ADDR` | _empty_ (required when enabled) |
+| `REDIS_TTL` | `24h` |
+| `REDIS_TIMEOUT` | `500ms` |
+| `REDIS_KEY_PREFIX` | `pubsub:seen:` |
 | `KAFKA_ENABLED` | `false` |
 | `KAFKA_BROKERS` | _empty_ (required when enabled) |
 | `KAFKA_TOPIC` | `salesforce.events` |
@@ -180,8 +188,9 @@ internal/
   health/                  Checker interface, /healthz, /readyz
   httpserver/              chi-based admin HTTP server
   log/                     zap logger constructor
-  handler/                 Handler implementations and the chain that composes them
+  handler/                 Handler implementations, the chain, and the dedup decorator
   kafka/                   franz-go producer, topic provisioning, metrics
+  rediscache/              processed-event cache backed by Redis
   pubsub/                  Salesforce Pub/Sub gRPC client and Subscriber
   schema/                  Avro schema cache and decoder
 proto/salesforce/          Salesforce .proto and generated Go code
@@ -242,8 +251,8 @@ The worker pool runs each decoded event through a handler chain. Order is a
 correctness constraint, not a preference:
 
 ```
-decode -> [ PersistHandler ] -> [ ForwardHandler ] -> ack to Salesforce
-             Postgres              Kafka
+decode -> ( dedup cache ) -> [ PersistHandler ] -> [ ForwardHandler ] -> ack
+              Redis               Postgres              Kafka
 ```
 
 An event is acknowledged to Salesforce only after the whole chain succeeds. A
@@ -289,6 +298,43 @@ deliberately: partition count caps consumer parallelism and cannot be lowered
 later, and replication factor decides how much broker loss the data survives.
 Guessing those at service startup is worse than failing loudly. Enable it for
 local development.
+
+
+### The deduplication cache
+
+Salesforce replays events after a reconnect, so duplicates are normal — and after
+a long outage they arrive in bulk. Correctness is already handled: `processed_events`
+has a UNIQUE constraint on the event UUID, so a duplicate insert does nothing.
+
+The cost is what the cache addresses. `Store.PersistEvent` wraps its work in a
+transaction, so every duplicate opens one, inserts nothing, updates nothing and
+commits. Checking Redis first ends that path before it reaches the database.
+
+Measured on the local containers used by the benchmark (`make bench`, 2000
+iterations each):
+
+| | ns per duplicate |
+|---|---|
+| Postgres rejects the duplicate | 412,591 |
+| Redis answers first | 141,520 |
+
+About 2.9x cheaper, saving roughly 270 µs per duplicate — so replaying 100,000
+events after an outage takes about 14s instead of 41s. Both stores are local
+containers here; with a managed database the gap widens, since the avoided call
+is the more expensive one.
+
+**The cache is never authoritative.** A lookup error is treated as a miss, not as
+"not seen", and processing falls through to Postgres. Redis being unavailable
+makes the service slower, never wrong.
+
+**It wraps the chain rather than joining it.** The event is marked as seen only
+after the wrapped handler returns nil, so "seen" means "finished every stage".
+Marking after persistence instead would let an event that was stored but not yet
+forwarded to Kafka be skipped on redelivery — and the stage that actually failed
+would never run.
+
+`REDIS_TTL` should cover the Salesforce replay window. Past it a duplicate can no
+longer arrive, so the entry is only occupying memory.
 
 ---
 
@@ -403,6 +449,9 @@ Prometheus metrics exposed at `/metrics` (Go runtime metrics included by default
 | `kafka_records_failed_total` | counter | |
 | `kafka_record_bytes_total` | counter | |
 | `kafka_produce_duration_seconds` | histogram | |
+| `dedup_cache_hits_total` | counter | |
+| `dedup_cache_misses_total` | counter | |
+| `dedup_cache_errors_total` | counter | `op` |
 
 Structured JSON logs via zap, written to stdout. Every log line includes the `service` and `version` fields (the version is injected at build time from `git describe`).
 

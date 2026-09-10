@@ -19,6 +19,7 @@ import (
 	"github.com/AndreyZubov/pubsub-event-processor/internal/httpserver"
 	appkafka "github.com/AndreyZubov/pubsub-event-processor/internal/kafka"
 	"github.com/AndreyZubov/pubsub-event-processor/internal/pubsub"
+	"github.com/AndreyZubov/pubsub-event-processor/internal/rediscache"
 	"github.com/AndreyZubov/pubsub-event-processor/internal/schema"
 	"github.com/AndreyZubov/pubsub-event-processor/internal/storage"
 	"github.com/AndreyZubov/pubsub-event-processor/internal/worker"
@@ -38,6 +39,7 @@ type App struct {
 	http     *httpserver.Server
 	store    *storage.Store
 	producer *appkafka.Producer
+	redis    *rediscache.Cache
 }
 
 // New constructs the App graph from configuration. reg receives all subsystem
@@ -110,6 +112,22 @@ func New(ctx context.Context, cfg *config.Config, log *zap.Logger, reg prometheu
 		)
 	}
 
+	// The chain is what must fully succeed before an event counts as processed.
+	var root handler.Handler = handler.NewChain(handlers...)
+
+	// The dedup cache wraps the chain rather than joining it, so an event is
+	// remembered only once every stage has succeeded.
+	var dedup *rediscache.Cache
+	if cfg.Redis.Enabled {
+		dedup = rediscache.New(cfg.Redis, log, reg)
+		root = handler.NewDedup(dedup, root, log)
+		checkers["redis"] = newRedisChecker(dedup)
+		log.Info("dedup cache enabled",
+			zap.String("addr", cfg.Redis.Addr),
+			zap.Duration("ttl", cfg.Redis.TTL),
+		)
+	}
+
 	a := &App{
 		cfg:      cfg,
 		log:      log,
@@ -119,9 +137,23 @@ func New(ctx context.Context, cfg *config.Config, log *zap.Logger, reg prometheu
 		http:     httpserver.New(cfg.HTTP.Addr, log, checkers),
 		store:    store,
 		producer: producer,
+		redis:    dedup,
 	}
-	a.pool = worker.New(cfg.Worker.Count, cache, handler.NewChain(handlers...), a.ack, log, reg)
+	a.pool = worker.New(cfg.Worker.Count, cache, root, a.ack, log, reg)
 	return a, nil
+}
+
+// newRedisChecker reports cache reachability to the readiness probe.
+//
+// Readiness is gated even though the cache is optional: an unreachable cache
+// means every event pays the full database cost, which is worth surfacing
+// rather than hiding behind a green probe.
+func newRedisChecker(c *rediscache.Cache) health.Checker {
+	return health.CheckerFunc(func(ctx context.Context) error {
+		ctx, cancel := context.WithTimeout(ctx, dbCheckTimeout)
+		defer cancel()
+		return c.Check(ctx)
+	})
 }
 
 // newDBChecker reports database reachability to the readiness probe.
@@ -149,6 +181,11 @@ func newKafkaChecker(p *appkafka.Producer) health.Checker {
 // Shutdown order mirrors construction in reverse: stop producing, then drop the
 // database pool, then close the gRPC client.
 func (a *App) Close() error {
+	if a.redis != nil {
+		if err := a.redis.Close(); err != nil {
+			a.log.Warn("close redis", zap.Error(err))
+		}
+	}
 	if a.producer != nil {
 		a.producer.Close()
 	}

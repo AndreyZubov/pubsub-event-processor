@@ -34,6 +34,16 @@ spec:
         - port: 5432
           protocol: TCP
     {{- end }}
+    {{- if and .Values.redis.enabled .Values.redis.deployRedis }}
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "processor.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: cache
+      ports:
+        - port: 6379
+          protocol: TCP
+    {{- end }}
     {{- if .Values.kafka.enabled }}
     # Kafka brokers. Narrow this to the broker namespace in a real cluster.
     - ports:
