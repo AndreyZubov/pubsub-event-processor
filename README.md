@@ -24,14 +24,14 @@ The service connects to a Salesforce org as an OAuth client, subscribes to one o
                     events channel
                           |
                  [ Worker pool ]   <- N goroutines, bounded
-                      /        \
-              [ Decoder ]   (Avro schema cache)
-                      |
-               [ Processor ]      <- idempotent handler
-                   /     \
-          [ Postgres ]   [ Sink: webhook / channel ]
                           |
-              [ Replay store ]    <- persists last replay ID
+                  [ Avro decoder ] (schema cache, singleflight)
+                          |
+                 [ Handler chain ] <- persist, then forward
+                     /         \
+            [ Postgres ]    [ Kafka ]
+                  |          (optional sink)
+          [ Replay cursor ]  <- advanced in the same transaction
 ```
 
 Cross-cutting components: OAuth token provider with cached refresh, structured zap logger, Prometheus metrics registry, environment-based config loader, graceful shutdown across all goroutines.
@@ -49,7 +49,9 @@ What works today (in `make run`):
 - **Bidirectional subscribe stream** — per-topic Subscriber opens a Pub/Sub `Subscribe` stream, drives pull-based flow control via `FetchRequest`, reconnects with exponential backoff and jitter on stream errors, and recovers replay capacity through downstream acknowledgements.
 - **Avro schema cache** — fetched schemas are parsed once and reused; concurrent cold-start lookups for the same `schema_id` are deduplicated via `singleflight`.
 - **Avro decoder** — payload bytes are decoded into a generic `map[string]any` keyed by field name, ready for storage and downstream sinks.
-- **End-to-end event pipeline** — subscribers fan-in into a single events channel that a consumer goroutine drains, decoding each event and emitting a structured log line per event.
+- **End-to-end event pipeline** — subscribers fan-in into a single events channel drained by a bounded worker pool, which decodes each event and runs it through a handler chain.
+- **Persistence** — decoded events are written to PostgreSQL and the topic's replay cursor advances in the same transaction. Idempotency comes from a UNIQUE constraint on the event UUID, so replay after a reconnect is a no-op rather than a duplicate.
+- **Kafka sink** (optional, `KAFKA_ENABLED`) — events are published as a JSON envelope, keyed by Salesforce topic, with an idempotent producer and `acks=all`. Readiness gates on broker reachability.
 - **Admin HTTP server** exposing `/healthz`, `/readyz` (aggregates per-subsystem checks), and `/metrics`.
 - **Startup topic discovery** — for each configured topic, the service queries Salesforce for its metadata and Avro schema and logs the result.
 - **Graceful shutdown** on `SIGINT` / `SIGTERM` with bounded drain timeouts coordinated through `errgroup`.
@@ -115,6 +117,13 @@ Optional knobs:
 | `HTTP_ADDR` | `:8080` |
 | `LOG_LEVEL` | `info` |
 | `SINK_WEBHOOK_URL` | _empty_ |
+| `KAFKA_ENABLED` | `false` |
+| `KAFKA_BROKERS` | _empty_ (required when enabled) |
+| `KAFKA_TOPIC` | `salesforce.events` |
+| `KAFKA_PRODUCE_TIMEOUT` | `30s` |
+| `KAFKA_CREATE_TOPIC` | `false` |
+| `KAFKA_TOPIC_PARTITIONS` | `3` |
+| `KAFKA_TOPIC_REPLICATION_FACTOR` | `1` |
 
 ### Run the service
 
@@ -152,10 +161,10 @@ Stop with `Ctrl+C` for a graceful shutdown.
 | 1 — Skeleton | Config, logging, health endpoints, Docker, base lifecycle | Done |
 | 2 — Auth + gRPC | OAuth token provider, gRPC client, GetTopic / GetSchema, readiness probe | Done |
 | 3 — Subscribe + decode | Subscribe stream client, Avro schema cache, Avro decoder | Done |
-| 4 — Process + persist | Worker pool, Postgres writes, idempotency on event UUID | Planned |
-| 5 — Reliability | Replay ID persistence, reconnect with resume, graceful drain | Planned |
-| 6 — Sink + observability | Webhook sink with retries, full metrics dashboard | Planned |
-| 7 — Polish | Integration tests with testcontainers, documentation, demo | Planned |
+| 4 — Process + persist | Worker pool, Postgres writes, idempotency on event UUID | Done |
+| 5 — Reliability | Replay ID persistence, reconnect with resume, graceful drain | Partial — replay cursor is persisted; resuming from it on startup is pending |
+| 6 — Sink + observability | Kafka sink, full metrics dashboard | Kafka done; dashboard pending |
+| 7 — Polish | Integration tests with testcontainers, documentation, demo | In progress |
 
 ---
 
@@ -171,6 +180,8 @@ internal/
   health/                  Checker interface, /healthz, /readyz
   httpserver/              chi-based admin HTTP server
   log/                     zap logger constructor
+  handler/                 Handler implementations and the chain that composes them
+  kafka/                   franz-go producer, topic provisioning, metrics
   pubsub/                  Salesforce Pub/Sub gRPC client and Subscriber
   schema/                  Avro schema cache and decoder
 proto/salesforce/          Salesforce .proto and generated Go code
@@ -222,6 +233,62 @@ make clean         # remove build artifacts
 ### Regenerating proto code
 
 `make proto` builds a small Docker image with `protoc` plus `protoc-gen-go` and `protoc-gen-go-grpc`, then generates Go code from `proto/salesforce/pubsub_api.proto`. The image is cached after the first build. The proto file itself is a lightly modified copy of the upstream Salesforce schema published at [developerforce/pub-sub-api](https://github.com/developerforce/pub-sub-api) — only the `go_package` option is customized to land the generated code in this module.
+
+---
+
+## Event delivery
+
+The worker pool runs each decoded event through a handler chain. Order is a
+correctness constraint, not a preference:
+
+```
+decode -> [ PersistHandler ] -> [ ForwardHandler ] -> ack to Salesforce
+             Postgres              Kafka
+```
+
+An event is acknowledged to Salesforce only after the whole chain succeeds. A
+Kafka outage therefore leaves the event unacknowledged, Salesforce redelivers it,
+the persist step deduplicates on event UUID, and the forward step retries — the
+failing stage is the one that repeats.
+
+Reversing the order would publish to Kafka first and then, after a database
+failure and redelivery, publish the same record again. Kafka's idempotent
+producer deduplicates retries within a producer session, not across process
+restarts, so consumers would see genuine duplicates.
+
+### The Kafka record
+
+| Part | Value |
+|------|-------|
+| Key | the Salesforce topic, e.g. `/event/Order_Event__e` |
+| Value | JSON envelope: `event_id`, `topic`, `schema_id`, `replay_id` (base64), `received_at`, `payload` |
+| Headers | `event_id`, `schema_id`, `sf_topic` |
+
+Keying by Salesforce topic sends every event from one channel to the same
+partition, which is what preserves their relative order downstream. The trade-off
+is that a single busy channel cannot spread across partitions; keying by an
+entity id would trade topic ordering for that parallelism.
+
+The envelope is deliberately explicit rather than the raw Avro payload — consumers
+get the metadata they need to route and deduplicate without running a schema
+registry.
+
+### Delivery guarantees
+
+Produces are synchronous and wait for all in-sync replicas. That is what lets the
+pool treat a produce failure as a handler failure instead of losing the record in
+a background buffer the caller cannot observe. `acks=all` also keeps franz-go's
+idempotent producer enabled — it disables itself under weaker acks — so a retry
+after a timeout cannot write the record twice.
+
+### Topic provisioning
+
+`KAFKA_CREATE_TOPIC` creates the topic at startup and is off by default. Real
+clusters run with `auto.create.topics.enable=false` and provision topics
+deliberately: partition count caps consumer parallelism and cannot be lowered
+later, and replication factor decides how much broker loss the data survives.
+Guessing those at service startup is worse than failing loudly. Enable it for
+local development.
 
 ---
 
@@ -329,6 +396,13 @@ Prometheus metrics exposed at `/metrics` (Go runtime metrics included by default
 | `pubsub_stream_open` | gauge | `topic` |
 | `schema_cache_hits_total` | counter | |
 | `schema_cache_misses_total` | counter | |
+| `events_processed_total` | counter | |
+| `events_failed_total` | counter | `stage` |
+| `processing_latency_seconds` | histogram | |
+| `kafka_records_produced_total` | counter | |
+| `kafka_records_failed_total` | counter | |
+| `kafka_record_bytes_total` | counter | |
+| `kafka_produce_duration_seconds` | histogram | |
 
 Structured JSON logs via zap, written to stdout. Every log line includes the `service` and `version` fields (the version is injected at build time from `git describe`).
 

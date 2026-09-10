@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"time"
 
 	"github.com/caarlos0/env/v11"
 )
@@ -15,6 +16,7 @@ type Config struct {
 	Salesforce SalesforceConfig
 	PubSub     PubSubConfig
 	Database   DatabaseConfig
+	Kafka      KafkaConfig
 	Sink       SinkConfig
 	HTTP       HTTPConfig
 	Worker     WorkerConfig
@@ -38,6 +40,30 @@ type PubSubConfig struct {
 type DatabaseConfig struct {
 	URL      string `env:"DATABASE_URL,required"`
 	MaxConns int    `env:"DATABASE_MAX_CONNS" envDefault:"20"`
+}
+
+// KafkaConfig holds settings for the Kafka sink. Disabled by default so the
+// service runs without a broker during local development.
+type KafkaConfig struct {
+	Enabled bool     `env:"KAFKA_ENABLED"  envDefault:"false"`
+	Brokers []string `env:"KAFKA_BROKERS"  envSeparator:","`
+	Topic   string   `env:"KAFKA_TOPIC"    envDefault:"salesforce.events"`
+	// ClientID identifies this producer in broker logs and metrics.
+	ClientID string `env:"KAFKA_CLIENT_ID" envDefault:"pubsub-event-processor"`
+	// ProduceTimeout bounds a single synchronous produce, including retries.
+	ProduceTimeout time.Duration `env:"KAFKA_PRODUCE_TIMEOUT" envDefault:"30s"`
+
+	// CreateTopic makes the service create the topic at startup if it is
+	// missing. Off by default: production clusters normally run with
+	// auto.create.topics.enable=false and provision topics deliberately, with
+	// partition counts and replication chosen for the workload. Enable it for
+	// local development and demo environments.
+	CreateTopic bool `env:"KAFKA_CREATE_TOPIC" envDefault:"false"`
+	// TopicPartitions applies only when CreateTopic is true.
+	TopicPartitions int32 `env:"KAFKA_TOPIC_PARTITIONS" envDefault:"3"`
+	// TopicReplicationFactor applies only when CreateTopic is true. A single
+	// replica is valid only for a single-broker development cluster.
+	TopicReplicationFactor int16 `env:"KAFKA_TOPIC_REPLICATION_FACTOR" envDefault:"1"`
 }
 
 // SinkConfig holds optional downstream sink settings.
@@ -97,6 +123,33 @@ func (c *Config) Validate() error {
 
 	if u, err := url.Parse(c.Salesforce.LoginURL); err != nil || u.Scheme == "" || u.Host == "" {
 		errs = append(errs, fmt.Errorf("SF_LOGIN_URL is not a valid absolute URL: %q", c.Salesforce.LoginURL))
+	}
+
+	if c.Kafka.Enabled {
+		if len(c.Kafka.Brokers) == 0 {
+			errs = append(errs, errors.New("KAFKA_BROKERS must be set when KAFKA_ENABLED is true"))
+		}
+		for i, b := range c.Kafka.Brokers {
+			if _, _, err := net.SplitHostPort(b); err != nil {
+				errs = append(errs, fmt.Errorf("KAFKA_BROKERS[%d] must be host:port: %w", i, err))
+			}
+		}
+		// Not reachable through the environment — the parser substitutes the
+		// default for an empty value — but it guards a Config built in code.
+		if c.Kafka.Topic == "" {
+			errs = append(errs, errors.New("KAFKA_TOPIC must not be empty when KAFKA_ENABLED is true"))
+		}
+		if c.Kafka.ProduceTimeout <= 0 {
+			errs = append(errs, fmt.Errorf("KAFKA_PRODUCE_TIMEOUT must be > 0, got %s", c.Kafka.ProduceTimeout))
+		}
+		if c.Kafka.CreateTopic {
+			if c.Kafka.TopicPartitions < 1 {
+				errs = append(errs, fmt.Errorf("KAFKA_TOPIC_PARTITIONS must be >= 1, got %d", c.Kafka.TopicPartitions))
+			}
+			if c.Kafka.TopicReplicationFactor < 1 {
+				errs = append(errs, fmt.Errorf("KAFKA_TOPIC_REPLICATION_FACTOR must be >= 1, got %d", c.Kafka.TopicReplicationFactor))
+			}
+		}
 	}
 
 	if c.Sink.WebhookURL != "" {

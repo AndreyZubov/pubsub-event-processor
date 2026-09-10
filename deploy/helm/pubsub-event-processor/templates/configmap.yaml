@@ -14,3 +14,13 @@ data:
   FLOW_BATCH_SIZE: {{ .Values.config.flowBatchSize | quote }}
   DATABASE_MAX_CONNS: {{ .Values.config.databaseMaxConns | quote }}
   SINK_WEBHOOK_URL: {{ .Values.config.sinkWebhookUrl | quote }}
+  KAFKA_ENABLED: {{ .Values.kafka.enabled | quote }}
+{{- if .Values.kafka.enabled }}
+  KAFKA_BROKERS: {{ required "kafka.brokers is required when kafka.enabled is true" .Values.kafka.brokers | quote }}
+  KAFKA_TOPIC: {{ .Values.kafka.topic | quote }}
+  KAFKA_CLIENT_ID: {{ .Values.kafka.clientId | quote }}
+  KAFKA_PRODUCE_TIMEOUT: {{ .Values.kafka.produceTimeout | quote }}
+  KAFKA_CREATE_TOPIC: {{ .Values.kafka.createTopic | quote }}
+  KAFKA_TOPIC_PARTITIONS: {{ .Values.kafka.topicPartitions | quote }}
+  KAFKA_TOPIC_REPLICATION_FACTOR: {{ .Values.kafka.topicReplicationFactor | quote }}
+{{- end }}

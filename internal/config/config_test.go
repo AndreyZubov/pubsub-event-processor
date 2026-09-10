@@ -4,6 +4,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 var allConfigEnvKeys = []string{
@@ -12,6 +13,9 @@ var allConfigEnvKeys = []string{
 	"DATABASE_URL", "DATABASE_MAX_CONNS", "SINK_WEBHOOK_URL",
 	"WORKER_COUNT", "FLOW_BATCH_SIZE",
 	"HTTP_ADDR", "LOG_LEVEL",
+	"KAFKA_ENABLED", "KAFKA_BROKERS", "KAFKA_TOPIC", "KAFKA_CLIENT_ID",
+	"KAFKA_PRODUCE_TIMEOUT", "KAFKA_CREATE_TOPIC",
+	"KAFKA_TOPIC_PARTITIONS", "KAFKA_TOPIC_REPLICATION_FACTOR",
 }
 
 func resetEnv(t *testing.T) {
@@ -199,6 +203,38 @@ func TestLoad_Errors(t *testing.T) {
 			wantErr: "SINK_WEBHOOK_URL",
 		},
 		{
+			name:    "kafka enabled without brokers",
+			env:     map[string]string{"KAFKA_ENABLED": "true"},
+			wantErr: "KAFKA_BROKERS must be set",
+		},
+		{
+			name: "kafka broker without port",
+			env: map[string]string{
+				"KAFKA_ENABLED": "true",
+				"KAFKA_BROKERS": "broker-without-port",
+			},
+			wantErr: "KAFKA_BROKERS[0] must be host:port",
+		},
+		{
+			name: "kafka zero produce timeout",
+			env: map[string]string{
+				"KAFKA_ENABLED":         "true",
+				"KAFKA_BROKERS":         "localhost:9092",
+				"KAFKA_PRODUCE_TIMEOUT": "0s",
+			},
+			wantErr: "KAFKA_PRODUCE_TIMEOUT must be > 0",
+		},
+		{
+			name: "kafka zero partitions when creating the topic",
+			env: map[string]string{
+				"KAFKA_ENABLED":          "true",
+				"KAFKA_BROKERS":          "localhost:9092",
+				"KAFKA_CREATE_TOPIC":     "true",
+				"KAFKA_TOPIC_PARTITIONS": "0",
+			},
+			wantErr: "KAFKA_TOPIC_PARTITIONS must be >= 1",
+		},
+		{
 			name:    "DATABASE_MAX_CONNS too low",
 			env:     map[string]string{"DATABASE_MAX_CONNS": "0"},
 			wantErr: "DATABASE_MAX_CONNS",
@@ -228,5 +264,62 @@ func TestLoad_Errors(t *testing.T) {
 				t.Fatalf("expected error containing %q, got %v", tc.wantErr, err)
 			}
 		})
+	}
+}
+
+// Kafka is opt-in: an otherwise valid configuration must load without any
+// KAFKA_* variables set, and invalid Kafka settings must be ignored while
+// KAFKA_ENABLED is false.
+func TestLoad_KafkaDisabledByDefault(t *testing.T) {
+	resetEnv(t)
+	setEnv(t, baseEnv())
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Kafka.Enabled {
+		t.Error("Kafka.Enabled = true, want false by default")
+	}
+
+	// Brokers are missing, which would be fatal if the sink were enabled.
+	setEnv(t, map[string]string{"KAFKA_ENABLED": "false", "KAFKA_BROKERS": ""})
+	if _, err := Load(); err != nil {
+		t.Errorf("Load with Kafka disabled and no brokers: %v", err)
+	}
+}
+
+func TestLoad_KafkaEnabled(t *testing.T) {
+	resetEnv(t)
+	setEnv(t, baseEnv())
+	setEnv(t, map[string]string{
+		"KAFKA_ENABLED":                  "true",
+		"KAFKA_BROKERS":                  "broker-1:9092,broker-2:9092",
+		"KAFKA_TOPIC":                    "sf.events",
+		"KAFKA_PRODUCE_TIMEOUT":          "5s",
+		"KAFKA_CREATE_TOPIC":             "true",
+		"KAFKA_TOPIC_PARTITIONS":         "6",
+		"KAFKA_TOPIC_REPLICATION_FACTOR": "3",
+	})
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	if got := len(cfg.Kafka.Brokers); got != 2 {
+		t.Fatalf("Brokers = %v, want 2 entries", cfg.Kafka.Brokers)
+	}
+	if cfg.Kafka.Brokers[1] != "broker-2:9092" {
+		t.Errorf("Brokers[1] = %q", cfg.Kafka.Brokers[1])
+	}
+	if cfg.Kafka.Topic != "sf.events" {
+		t.Errorf("Topic = %q", cfg.Kafka.Topic)
+	}
+	if cfg.Kafka.ProduceTimeout != 5*time.Second {
+		t.Errorf("ProduceTimeout = %s", cfg.Kafka.ProduceTimeout)
+	}
+	if cfg.Kafka.TopicPartitions != 6 || cfg.Kafka.TopicReplicationFactor != 3 {
+		t.Errorf("partitions/replication = %d/%d", cfg.Kafka.TopicPartitions, cfg.Kafka.TopicReplicationFactor)
 	}
 }

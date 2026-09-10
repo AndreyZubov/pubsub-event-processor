@@ -4,6 +4,7 @@ Image:    {{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.A
 Replicas: {{ .Values.replicaCount }}
 Topics:   {{ .Values.config.topics }}
 Database: {{ if .Values.postgres.enabled }}bundled Postgres ({{ include "processor.postgres.fullname" . }}){{ else }}external{{ end }}
+Kafka:    {{ if .Values.kafka.enabled }}{{ .Values.kafka.brokers }} -> topic {{ .Values.kafka.topic }}{{ else }}disabled{{ end }}
 
 1. Watch the pod come up:
 

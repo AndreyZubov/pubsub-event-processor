@@ -4,6 +4,7 @@ package storage_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -256,25 +257,9 @@ func isCanceledLike(err error) bool {
 		return false
 	}
 	for _, target := range []error{context.Canceled, context.DeadlineExceeded, pgx.ErrTxClosed} {
-		if errorsIs(err, target) {
+		if errors.Is(err, target) {
 			return true
 		}
-	}
-	return false
-}
-
-// errorsIs is a small local helper to keep the file standalone.
-func errorsIs(err, target error) bool {
-	type unwrapper interface{ Unwrap() error }
-	for err != nil {
-		if err == target {
-			return true
-		}
-		u, ok := err.(unwrapper)
-		if !ok {
-			return false
-		}
-		err = u.Unwrap()
 	}
 	return false
 }
