@@ -1,0 +1,29 @@
+# VCS
+.git/
+.gitignore
+.github/
+
+# Local tooling and editor state
+.idea/
+.vscode/
+.claude/
+CLAUDE.local.md
+
+# Secrets and local environment
+.env
+.env.*
+
+# Build artifacts and coverage
+bin/
+dist/
+*.test
+*.out
+coverage.out
+coverage.html
+
+# Docs, deployment manifests, scripts not needed in the build context
+docs/
+deploy/
+scripts/
+README.md
+LICENSE

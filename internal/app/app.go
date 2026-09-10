@@ -13,11 +13,12 @@ import (
 
 	"github.com/AndreyZubov/pubsub-event-processor/internal/auth"
 	"github.com/AndreyZubov/pubsub-event-processor/internal/config"
-	"github.com/AndreyZubov/pubsub-event-processor/internal/event"
+	"github.com/AndreyZubov/pubsub-event-processor/internal/handler"
 	"github.com/AndreyZubov/pubsub-event-processor/internal/health"
 	"github.com/AndreyZubov/pubsub-event-processor/internal/httpserver"
 	"github.com/AndreyZubov/pubsub-event-processor/internal/pubsub"
 	"github.com/AndreyZubov/pubsub-event-processor/internal/schema"
+	"github.com/AndreyZubov/pubsub-event-processor/internal/worker"
 )
 
 // App is the running service: wired subsystems with a shared lifecycle.
@@ -27,6 +28,7 @@ type App struct {
 	client *pubsub.Client
 	cache  *schema.Cache
 	subs   []*pubsub.Subscriber
+	pool   *worker.Pool
 	http   *httpserver.Server
 }
 
@@ -61,14 +63,16 @@ func New(cfg *config.Config, log *zap.Logger, reg prometheus.Registerer) (*App, 
 		"auth": health.NewAuthChecker(tp),
 	}
 
-	return &App{
+	a := &App{
 		cfg:    cfg,
 		log:    log,
 		client: client,
 		cache:  cache,
 		subs:   subs,
 		http:   httpserver.New(cfg.HTTP.Addr, log, checkers),
-	}, nil
+	}
+	a.pool = worker.New(cfg.Worker.Count, cache, handler.NewLog(log), a.ack, log, reg)
+	return a, nil
 }
 
 // Close releases resources held by the App. Safe to call multiple times.
@@ -90,10 +94,6 @@ func (a *App) Run(ctx context.Context) error {
 	g, gctx := errgroup.WithContext(ctx)
 
 	events := make(chan pubsub.RawEvent, a.cfg.Worker.FlowBatchSize*2)
-	topicSubs := make(map[string]*pubsub.Subscriber, len(a.subs))
-	for _, sub := range a.subs {
-		topicSubs[sub.Topic()] = sub
-	}
 
 	for _, sub := range a.subs {
 		g.Go(func() error { return sub.Run(gctx) })
@@ -109,10 +109,7 @@ func (a *App) Run(ctx context.Context) error {
 		close(events)
 	}()
 
-	g.Go(func() error {
-		a.consume(gctx, events, topicSubs)
-		return nil
-	})
+	g.Go(func() error { return a.pool.Run(gctx, events) })
 
 	g.Go(func() error { return a.http.Run(gctx) })
 
@@ -122,6 +119,17 @@ func (a *App) Run(ctx context.Context) error {
 
 	a.log.Info("app stopped")
 	return nil
+}
+
+// ack is the worker pool's flow-control callback: it looks up the source
+// subscriber by topic and signals N events have been processed.
+func (a *App) ack(topic string, n int) {
+	for _, sub := range a.subs {
+		if sub.Topic() == topic {
+			sub.Ack(n)
+			return
+		}
+	}
 }
 
 // fanIn forwards events from one subscriber's Out channel onto the shared
@@ -135,65 +143,6 @@ func (a *App) fanIn(ctx context.Context, wg *sync.WaitGroup, sub *pubsub.Subscri
 			return
 		}
 	}
-}
-
-// consume drains the shared events channel, decoding each event and logging
-// the result. After successful processing the source subscriber is ack'd for
-// flow-control replenishment.
-func (a *App) consume(ctx context.Context, events <-chan pubsub.RawEvent, topicSubs map[string]*pubsub.Subscriber) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case raw, ok := <-events:
-			if !ok {
-				return
-			}
-			a.processEvent(ctx, raw)
-			if sub, ok := topicSubs[raw.Topic]; ok {
-				sub.Ack(1)
-			}
-		}
-	}
-}
-
-func (a *App) processEvent(ctx context.Context, raw pubsub.RawEvent) {
-	schemaID := raw.Event.GetEvent().GetSchemaId()
-	sch, err := a.cache.Get(ctx, schemaID)
-	if err != nil {
-		a.log.Warn("schema fetch failed",
-			zap.String("topic", raw.Topic),
-			zap.String("schema_id", schemaID),
-			zap.Error(err),
-		)
-		return
-	}
-
-	payload, err := schema.Decode(sch, raw.Event.GetEvent().GetPayload())
-	if err != nil {
-		a.log.Warn("avro decode failed",
-			zap.String("topic", raw.Topic),
-			zap.String("schema_id", schemaID),
-			zap.Error(err),
-		)
-		return
-	}
-
-	decoded := event.DecodedEvent{
-		Topic:      raw.Topic,
-		EventID:    raw.Event.GetEvent().GetId(),
-		SchemaID:   schemaID,
-		ReplayID:   raw.Event.GetReplayId(),
-		Payload:    payload,
-		ReceivedAt: raw.ReceivedAt,
-	}
-
-	a.log.Info("event decoded",
-		zap.String("topic", decoded.Topic),
-		zap.String("event_id", decoded.EventID),
-		zap.String("schema_id", decoded.SchemaID),
-		zap.Int("payload_fields", len(decoded.Payload)),
-	)
 }
 
 // discoverTopics queries Salesforce for each configured topic and its schema,

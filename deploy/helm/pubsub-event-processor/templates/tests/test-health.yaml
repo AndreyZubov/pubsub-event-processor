@@ -1,0 +1,37 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ include "processor.fullname" . }}-test-health
+  labels:
+    {{- include "processor.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: test
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  restartPolicy: Never
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: check
+      image: curlimages/curl:8.11.1
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop:
+            - ALL
+      command:
+        - sh
+        - -c
+        - |
+          set -e
+          host="{{ include "processor.fullname" . }}:{{ .Values.service.port }}"
+          echo "GET /healthz"
+          curl -sf "http://${host}/healthz"
+          echo
+          echo "GET /metrics"
+          curl -sf "http://${host}/metrics" | head -1
+          echo "ok"

@@ -1,0 +1,24 @@
+apiVersion: v2
+name: pubsub-event-processor
+description: Salesforce Pub/Sub event processor — subscribes to Platform Events over gRPC, decodes Avro, persists to PostgreSQL
+type: application
+
+# Chart version — bumped when the chart changes.
+version: 0.1.0
+# Version of the application this chart deploys by default.
+appVersion: "0.1.0"
+
+keywords:
+  - salesforce
+  - grpc
+  - pubsub
+  - event-driven
+  - golang
+
+home: https://github.com/AndreyZubov/pubsub-event-processor
+sources:
+  - https://github.com/AndreyZubov/pubsub-event-processor
+
+maintainers:
+  - name: Andrey Zubov
+    url: https://github.com/AndreyZubov

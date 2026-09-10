@@ -176,6 +176,7 @@ internal/
 proto/salesforce/          Salesforce .proto and generated Go code
 scripts/                   dev scripts (proto generation, git hooks)
 deploy/docker/             docker-compose, service Dockerfile
+deploy/helm/               Helm chart and local kind values
 migrations/                SQL migrations (used in milestone 4)
 ```
 
@@ -221,6 +222,94 @@ make clean         # remove build artifacts
 ### Regenerating proto code
 
 `make proto` builds a small Docker image with `protoc` plus `protoc-gen-go` and `protoc-gen-go-grpc`, then generates Go code from `proto/salesforce/pubsub_api.proto`. The image is cached after the first build. The proto file itself is a lightly modified copy of the upstream Salesforce schema published at [developerforce/pub-sub-api](https://github.com/developerforce/pub-sub-api) — only the `go_package` option is customized to land the generated code in this module.
+
+---
+
+## Kubernetes
+
+The service ships with a Helm chart in `deploy/helm/pubsub-event-processor`. It is
+exercised against a local [kind](https://kind.sigs.k8s.io/) cluster on every change.
+
+```bash
+make kind-up        # create the cluster if needed
+make k8s-deploy     # build the image, side-load it into kind, install the chart
+make k8s-status     # pods, and which of them the Service actually routes to
+make k8s-forward    # then curl localhost:8080/healthz | /readyz | /metrics
+make k8s-logs
+make k8s-undeploy
+```
+
+`make helm-validate` renders the chart and checks it against the live cluster API
+with a server-side dry run — stricter than client-side linting, since it runs the
+same admission and schema validation a real apply would.
+
+### What the chart deploys
+
+| Object | Notes |
+|--------|-------|
+| Deployment | the processor, with startup / liveness / readiness probes |
+| Service | ClusterIP on the admin port |
+| ConfigMap | non-secret configuration |
+| Secret | Salesforce credentials and the database DSN, or an existing Secret |
+| ServiceAccount | no API access, token not mounted |
+| StatefulSet | optional bundled PostgreSQL for demos (`postgres.enabled`) |
+| PodDisruptionBudget | optional, off by default |
+| NetworkPolicy | optional, restricts egress to DNS, Postgres, and Salesforce |
+| ServiceMonitor | optional, for the Prometheus Operator |
+
+### Design decisions worth knowing
+
+**Liveness must not depend on Salesforce or Postgres.** `/healthz` answers 200
+whenever the process is alive; `/readyz` aggregates the subsystem checks. If
+liveness gated on an upstream dependency, an outage there would restart every pod
+in a loop and make recovery strictly slower. Readiness pulls a pod out of the
+Service without restarting it, which is the behaviour you want.
+
+You can see this in the demo: with placeholder credentials the pod stays `Running`
+with **zero restarts** while `/readyz` returns 503 and the EndpointSlice reports
+`ready=false`. Deploying with real credentials is what flips it to ready.
+
+**`replicaCount` stays at 1, and no HorizontalPodAutoscaler ships with the chart.**
+The service opens a Pub/Sub Subscribe stream per configured topic. Two pods with
+the same `SF_TOPICS` both receive every event, so scaling out multiplies the work
+instead of sharing it. Persistence is idempotent on event UUID, so duplicates are
+absorbed rather than corrupting data — but the effort and the org's event delivery
+allocation are spent twice. Scaling this consumer horizontally is a partitioning
+problem to solve first, not a replica count to raise.
+
+**Deployment strategy is `Recreate`, not `RollingUpdate`.** During a rolling update
+the old and new pods would briefly both hold Subscribe streams over the same
+topics. With a single replica the cost of `Recreate` is a short gap in consumption,
+and replay-ID resume covers it: events are delayed, not lost.
+
+**`terminationGracePeriodSeconds` is 30.** The admin HTTP server allows itself 10s
+to drain, and the worker pool finishes in-flight events on top of that. Measured
+shutdown after `SIGTERM` is about a second, so the margin is generous — but the
+grace period must exceed the application's own budget, or Kubernetes sends
+`SIGKILL` mid-drain.
+
+**An init container waits for Postgres.** Migrations run at startup, so without the
+wait the pod crash-loops until the database accepts connections. It works either
+way; the init container just turns restart noise into a clean wait.
+
+**The pod is hardened**: non-root, read-only root filesystem, all capabilities
+dropped, no privilege escalation, `RuntimeDefault` seccomp, and no ServiceAccount
+token mounted. `/tmp` is an `emptyDir`, since the root filesystem is read-only.
+
+**Config changes roll the pods.** The Deployment carries `checksum/config` and
+`checksum/secret` annotations over the rendered ConfigMap and Secret. Without them
+a `helm upgrade` that only edits configuration would leave the running pods on the
+old values until something else restarted them.
+
+**No CPU limit, only a memory limit.** CFS throttling on a latency-sensitive stream
+consumer produces worse tail behaviour than brief bursts above the request. Memory
+is limited because exceeding it should kill the pod rather than the node.
+
+### Production notes
+
+The bundled Postgres is a single replica with no backups — it exists for demos and
+CI. For anything real, point `DATABASE_URL` at a managed database and set
+`secrets.existingSecret` so credentials are not stored in the Helm release.
 
 ---
 

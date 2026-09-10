@@ -40,7 +40,6 @@ linters:
         - G104
     loggercheck:
       zap: true
-      sugar: true
   exclusions:
     rules:
       - path: _test\.go
@@ -63,7 +62,8 @@ formatters:
         - prefix(github.com/AndreyZubov/pubsub-event-processor)
       custom-order: true
     gofumpt:
-      extra-rules: true
+      extra:
+        group-params: true
 
 issues:
   max-issues-per-linter: 0
