@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
@@ -16,26 +17,33 @@ import (
 	"github.com/AndreyZubov/pubsub-event-processor/internal/handler"
 	"github.com/AndreyZubov/pubsub-event-processor/internal/health"
 	"github.com/AndreyZubov/pubsub-event-processor/internal/httpserver"
+	appkafka "github.com/AndreyZubov/pubsub-event-processor/internal/kafka"
 	"github.com/AndreyZubov/pubsub-event-processor/internal/pubsub"
 	"github.com/AndreyZubov/pubsub-event-processor/internal/schema"
+	"github.com/AndreyZubov/pubsub-event-processor/internal/storage"
 	"github.com/AndreyZubov/pubsub-event-processor/internal/worker"
 )
 
+// dbCheckTimeout bounds the readiness probe's database ping.
+const dbCheckTimeout = 3 * time.Second
+
 // App is the running service: wired subsystems with a shared lifecycle.
 type App struct {
-	cfg    *config.Config
-	log    *zap.Logger
-	client *pubsub.Client
-	cache  *schema.Cache
-	subs   []*pubsub.Subscriber
-	pool   *worker.Pool
-	http   *httpserver.Server
+	cfg      *config.Config
+	log      *zap.Logger
+	client   *pubsub.Client
+	cache    *schema.Cache
+	subs     []*pubsub.Subscriber
+	pool     *worker.Pool
+	http     *httpserver.Server
+	store    *storage.Store
+	producer *appkafka.Producer
 }
 
 // New constructs the App graph from configuration. reg receives all subsystem
 // metrics; pass prometheus.DefaultRegisterer in production and a fresh
 // prometheus.NewRegistry() in tests.
-func New(cfg *config.Config, log *zap.Logger, reg prometheus.Registerer) (*App, error) {
+func New(ctx context.Context, cfg *config.Config, log *zap.Logger, reg prometheus.Registerer) (*App, error) {
 	tp := auth.New(cfg.Salesforce, reg)
 
 	client, err := pubsub.Dial(cfg.PubSub, tp, log, reg)
@@ -59,24 +67,94 @@ func New(cfg *config.Config, log *zap.Logger, reg prometheus.Registerer) (*App, 
 		subs = append(subs, pubsub.NewSubscriber(client, topic, cfg.Worker.FlowBatchSize, log, reg))
 	}
 
+	dbPool, err := storage.NewPool(ctx, cfg.Database.URL, cfg.Database.MaxConns)
+	if err != nil {
+		// Everything constructed so far owns a connection; release it before
+		// returning, or a failed startup leaks the gRPC client.
+		_ = client.Close()
+		return nil, fmt.Errorf("database pool: %w", err)
+	}
+	store := storage.NewStore(dbPool)
+
 	checkers := map[string]health.Checker{
-		"auth": health.NewAuthChecker(tp),
+		"auth":     health.NewAuthChecker(tp),
+		"database": newDBChecker(store),
+	}
+
+	// Persistence first, forwarding second — see handler.Chain for why the
+	// order is a correctness constraint rather than a preference.
+	handlers := []handler.Handler{handler.NewPersist(store, log)}
+
+	var producer *appkafka.Producer
+	if cfg.Kafka.Enabled {
+		producer, err = appkafka.New(cfg.Kafka, log, reg)
+		if err != nil {
+			store.Close()
+			_ = client.Close()
+			return nil, fmt.Errorf("kafka producer: %w", err)
+		}
+		if cfg.Kafka.CreateTopic {
+			if err := producer.EnsureTopic(ctx); err != nil {
+				producer.Close()
+				store.Close()
+				_ = client.Close()
+				return nil, fmt.Errorf("ensure kafka topic: %w", err)
+			}
+		}
+
+		handlers = append(handlers, handler.NewForward(producer, log))
+		checkers["kafka"] = newKafkaChecker(producer)
+		log.Info("kafka sink enabled",
+			zap.Strings("brokers", cfg.Kafka.Brokers),
+			zap.String("topic", cfg.Kafka.Topic),
+		)
 	}
 
 	a := &App{
-		cfg:    cfg,
-		log:    log,
-		client: client,
-		cache:  cache,
-		subs:   subs,
-		http:   httpserver.New(cfg.HTTP.Addr, log, checkers),
+		cfg:      cfg,
+		log:      log,
+		client:   client,
+		cache:    cache,
+		subs:     subs,
+		http:     httpserver.New(cfg.HTTP.Addr, log, checkers),
+		store:    store,
+		producer: producer,
 	}
-	a.pool = worker.New(cfg.Worker.Count, cache, handler.NewLog(log), a.ack, log, reg)
+	a.pool = worker.New(cfg.Worker.Count, cache, handler.NewChain(handlers...), a.ack, log, reg)
 	return a, nil
 }
 
+// newDBChecker reports database reachability to the readiness probe.
+func newDBChecker(store *storage.Store) health.Checker {
+	return health.CheckerFunc(func(ctx context.Context) error {
+		ctx, cancel := context.WithTimeout(ctx, dbCheckTimeout)
+		defer cancel()
+		if err := store.Pool().Ping(ctx); err != nil {
+			return fmt.Errorf("database ping: %w", err)
+		}
+		return nil
+	})
+}
+
+// newKafkaChecker reports broker reachability to the readiness probe.
+func newKafkaChecker(p *appkafka.Producer) health.Checker {
+	return health.CheckerFunc(func(ctx context.Context) error {
+		ctx, cancel := context.WithTimeout(ctx, dbCheckTimeout)
+		defer cancel()
+		return p.Check(ctx)
+	})
+}
+
 // Close releases resources held by the App. Safe to call multiple times.
+// Shutdown order mirrors construction in reverse: stop producing, then drop the
+// database pool, then close the gRPC client.
 func (a *App) Close() error {
+	if a.producer != nil {
+		a.producer.Close()
+	}
+	if a.store != nil {
+		a.store.Close()
+	}
 	return a.client.Close()
 }
 

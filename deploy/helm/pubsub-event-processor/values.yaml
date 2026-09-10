@@ -65,6 +65,24 @@ config:
   # -- Optional webhook sink. Empty disables it.
   sinkWebhookUrl: ""
 
+# Kafka sink. Disabled by default so the chart deploys without a broker.
+kafka:
+  enabled: false
+  # -- Comma-separated broker list, e.g. "kafka-0:9092,kafka-1:9092".
+  brokers: ""
+  topic: salesforce.events
+  clientId: pubsub-event-processor
+  # Bounds one synchronous produce, including retries.
+  produceTimeout: 30s
+  # -- Create the topic at startup if missing.
+  #
+  # For development only. Production clusters provision topics deliberately:
+  # partition count caps consumer parallelism and cannot be lowered later, and
+  # replication factor decides how much broker loss the data survives.
+  createTopic: false
+  topicPartitions: 3
+  topicReplicationFactor: 1
+
 # Secret material. Prefer existingSecret in any real environment: values passed
 # here end up in the Helm release stored in the cluster.
 secrets:

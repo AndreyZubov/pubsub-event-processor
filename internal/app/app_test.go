@@ -30,7 +30,7 @@ func testConfig() *config.Config {
 }
 
 func TestApp_RunStopsCleanly(t *testing.T) {
-	a, err := New(testConfig(), zap.NewNop(), prometheus.NewRegistry())
+	a, err := New(context.Background(), testConfig(), zap.NewNop(), prometheus.NewRegistry())
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

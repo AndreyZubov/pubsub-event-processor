@@ -49,7 +49,7 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	a, err := app.New(cfg, logger, prometheus.DefaultRegisterer)
+	a, err := app.New(ctx, cfg, logger, prometheus.DefaultRegisterer)
 	if err != nil {
 		logger.Error("app init failed", zap.Error(err))
 		return err

@@ -34,6 +34,14 @@ spec:
         - port: 5432
           protocol: TCP
     {{- end }}
+    {{- if .Values.kafka.enabled }}
+    # Kafka brokers. Narrow this to the broker namespace in a real cluster.
+    - ports:
+        - port: 9092
+          protocol: TCP
+        - port: 9093
+          protocol: TCP
+    {{- end }}
     # Salesforce: OAuth over 443, Pub/Sub gRPC over 7443.
     - to:
         {{- range .Values.networkPolicy.allowedExternalCIDRs }}
