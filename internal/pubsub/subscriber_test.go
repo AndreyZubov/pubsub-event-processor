@@ -57,6 +57,36 @@ func (f *fakeSubServer) callCount() int {
 	return f.calls
 }
 
+type noCursor struct{}
+
+func (noCursor) LoadReplay(context.Context, string) ([]byte, error) { return nil, nil } //nolint:nilnil // matches CursorLoader's "never committed" contract
+
+type fixedCursor struct {
+	mu    sync.Mutex
+	rid   []byte
+	err   error
+	calls int
+}
+
+func (f *fixedCursor) LoadReplay(context.Context, string) ([]byte, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls++
+	return f.rid, f.err
+}
+
+func (f *fixedCursor) callCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
+}
+
+func (f *fixedCursor) setErr(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.err = err
+}
+
 func newBufconnSubClient(t *testing.T, fake *fakeSubServer) *Client {
 	t.Helper()
 	lis := bufconn.Listen(1 << 20)
@@ -105,7 +135,7 @@ func TestSubscriber_ReceivesEventsAndInitialFetchRequest(t *testing.T) {
 	}
 
 	client := newBufconnSubClient(t, fake)
-	sub := NewSubscriber(client, "/event/Test__e", 10, zap.NewNop(), prometheus.NewRegistry())
+	sub := NewSubscriber(client, "/event/Test__e", 10, noCursor{}, zap.NewNop(), prometheus.NewRegistry())
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -188,7 +218,7 @@ func TestSubscriber_SendsReplenishOnAck(t *testing.T) {
 	}
 
 	client := newBufconnSubClient(t, fake)
-	sub := NewSubscriber(client, "/event/X", 50, zap.NewNop(), prometheus.NewRegistry())
+	sub := NewSubscriber(client, "/event/X", 50, noCursor{}, zap.NewNop(), prometheus.NewRegistry())
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -235,7 +265,7 @@ func TestSubscriber_ReconnectsAfterStreamError(t *testing.T) {
 	}
 
 	client := newBufconnSubClient(t, fake)
-	sub := NewSubscriber(client, "/event/X", 5, zap.NewNop(), prometheus.NewRegistry())
+	sub := NewSubscriber(client, "/event/X", 5, noCursor{}, zap.NewNop(), prometheus.NewRegistry())
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -271,7 +301,7 @@ func TestSubscriber_StopsCleanlyOnCtxCancel(t *testing.T) {
 	}
 
 	client := newBufconnSubClient(t, fake)
-	sub := NewSubscriber(client, "/event/X", 5, zap.NewNop(), prometheus.NewRegistry())
+	sub := NewSubscriber(client, "/event/X", 5, noCursor{}, zap.NewNop(), prometheus.NewRegistry())
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -297,8 +327,8 @@ func TestSubscriber_StopsCleanlyOnCtxCancel(t *testing.T) {
 
 func TestNewSubscriber_SharesMetricsAcrossTopics(t *testing.T) {
 	reg := prometheus.NewRegistry()
-	a := NewSubscriber(nil, "/event/A", 1, zap.NewNop(), reg)
-	b := NewSubscriber(nil, "/event/B", 1, zap.NewNop(), reg)
+	a := NewSubscriber(nil, "/event/A", 1, noCursor{}, zap.NewNop(), reg)
+	b := NewSubscriber(nil, "/event/B", 1, noCursor{}, zap.NewNop(), reg)
 
 	a.metrics.eventsReceived.WithLabelValues("/event/A").Inc()
 	b.metrics.eventsReceived.WithLabelValues("/event/B").Inc()
@@ -316,4 +346,139 @@ func TestNewSubscriber_SharesMetricsAcrossTopics(t *testing.T) {
 		}
 	}
 	t.Error("pubsub_events_received_total not registered")
+}
+
+// recordFirstRequestThenHold records the stream's initial FetchRequest and
+// keeps the stream open until the client goes away.
+func recordFirstRequestThenHold(srv *fakeSubServer, stream salesforcepb.PubSub_SubscribeServer) error {
+	req, err := stream.Recv()
+	if err != nil {
+		return err
+	}
+	srv.recordRequest(req)
+	<-stream.Context().Done()
+	return nil
+}
+
+func waitForRequests(t *testing.T, fake *fakeSubServer, n int) []*salesforcepb.FetchRequest {
+	t.Helper()
+	deadline := time.After(5 * time.Second)
+	for {
+		if reqs := fake.snapshotRequests(); len(reqs) >= n {
+			return reqs
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("timed out waiting for %d FetchRequests", n)
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
+func TestSubscriber_FirstStreamResumesFromCommittedCursor(t *testing.T) {
+	fake := &fakeSubServer{behavior: recordFirstRequestThenHold}
+	client := newBufconnSubClient(t, fake)
+	cursor := &fixedCursor{rid: []byte{0xAB}}
+	sub := NewSubscriber(client, "/event/X", 5, cursor, zap.NewNop(), prometheus.NewRegistry())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- sub.Run(ctx) }()
+
+	initial := waitForRequests(t, fake, 1)[0]
+	cancel()
+	<-done
+
+	if initial.GetReplayPreset() != salesforcepb.ReplayPreset_CUSTOM {
+		t.Errorf("ReplayPreset: got %v, want CUSTOM", initial.GetReplayPreset())
+	}
+	if string(initial.GetReplayId()) != string([]byte{0xAB}) {
+		t.Errorf("ReplayId: got %v, want [0xAB]", initial.GetReplayId())
+	}
+}
+
+func TestSubscriber_ReconnectResumesAfterLastReceivedEvent(t *testing.T) {
+	fake := &fakeSubServer{}
+	var firstCall atomic.Bool
+	fake.behavior = func(srv *fakeSubServer, stream salesforcepb.PubSub_SubscribeServer) error {
+		if !firstCall.CompareAndSwap(false, true) {
+			return recordFirstRequestThenHold(srv, stream)
+		}
+		req, err := stream.Recv()
+		if err != nil {
+			return err
+		}
+		srv.recordRequest(req)
+		err = stream.Send(&salesforcepb.FetchResponse{
+			Events: []*salesforcepb.ConsumerEvent{
+				{Event: &salesforcepb.ProducerEvent{Id: "a"}, ReplayId: []byte{0x04}},
+				{Event: &salesforcepb.ProducerEvent{Id: "b"}, ReplayId: []byte{0x05}},
+			},
+		})
+		if err != nil {
+			return err
+		}
+		return status.Error(codes.Unavailable, "simulated transient")
+	}
+
+	client := newBufconnSubClient(t, fake)
+	cursor := &fixedCursor{rid: []byte{0x01}}
+	sub := NewSubscriber(client, "/event/X", 5, cursor, zap.NewNop(), prometheus.NewRegistry())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- sub.Run(ctx) }()
+
+	var seqs []uint64
+	for range 2 {
+		select {
+		case ev := <-sub.Out():
+			seqs = append(seqs, ev.Seq)
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for events")
+		}
+	}
+
+	reqs := waitForRequests(t, fake, 2)
+	cancel()
+	<-done
+
+	if seqs[0] != 1 || seqs[1] != 2 {
+		t.Errorf("seqs: got %v, want [1 2]", seqs)
+	}
+	resumed := reqs[1]
+	if resumed.GetReplayPreset() != salesforcepb.ReplayPreset_CUSTOM {
+		t.Errorf("reconnect ReplayPreset: got %v, want CUSTOM", resumed.GetReplayPreset())
+	}
+	if string(resumed.GetReplayId()) != string([]byte{0x05}) {
+		t.Errorf("reconnect ReplayId: got %v, want last received [0x05]", resumed.GetReplayId())
+	}
+	if n := cursor.callCount(); n != 1 {
+		t.Errorf("committed cursor loads: got %d, want 1 (reconnects use the in-memory position)", n)
+	}
+}
+
+func TestSubscriber_DoesNotSubscribeUntilCursorLoads(t *testing.T) {
+	fake := &fakeSubServer{behavior: recordFirstRequestThenHold}
+	client := newBufconnSubClient(t, fake)
+	cursor := &fixedCursor{err: fmt.Errorf("database unavailable")}
+	sub := NewSubscriber(client, "/event/X", 5, cursor, zap.NewNop(), prometheus.NewRegistry())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- sub.Run(ctx) }()
+
+	time.Sleep(200 * time.Millisecond)
+	if c := fake.callCount(); c != 0 {
+		t.Fatalf("Subscribe calls while cursor is unavailable: got %d, want 0", c)
+	}
+
+	cursor.setErr(nil)
+	initial := waitForRequests(t, fake, 1)[0]
+	cancel()
+	<-done
+
+	if initial.GetReplayPreset() != salesforcepb.ReplayPreset_LATEST {
+		t.Errorf("ReplayPreset with no committed cursor: got %v, want LATEST", initial.GetReplayPreset())
+	}
 }

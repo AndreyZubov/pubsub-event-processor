@@ -13,9 +13,8 @@ import (
 // at the point of use, so the handler package does not depend on the storage
 // package and can be tested with a fake.
 type EventStore interface {
-	// PersistEvent writes the event and advances the topic's replay cursor in
-	// one transaction. It reports inserted=false when the event UUID was
-	// already stored, which is a successful no-op, not an error.
+	// PersistEvent writes the event. It reports inserted=false when the event
+	// UUID was already stored, which is a successful no-op, not an error.
 	PersistEvent(ctx context.Context, e event.DecodedEvent) (bool, error)
 }
 

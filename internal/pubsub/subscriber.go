@@ -25,9 +25,19 @@ const (
 // RawEvent is a single Salesforce event received over the Subscribe stream,
 // carried with the topic that produced it for downstream multiplexing.
 type RawEvent struct {
-	Topic      string
+	Topic string
+	// Seq is the event's position in the topic's stream as seen by this
+	// process: 1 for the first event, incrementing by one, across reconnects.
+	// Downstream uses it to tell which events are still in flight.
+	Seq        uint64
 	Event      *salesforcepb.ConsumerEvent
 	ReceivedAt time.Time
+}
+
+// CursorLoader returns the committed replay cursor for a topic, or nil when
+// none has been committed yet.
+type CursorLoader interface {
+	LoadReplay(ctx context.Context, topic string) ([]byte, error)
 }
 
 // Subscriber owns one Subscribe stream for one topic. It pushes received events
@@ -36,10 +46,17 @@ type Subscriber struct {
 	client    *Client
 	topic     string
 	batchSize int32
+	cursors   CursorLoader
 	log       *zap.Logger
 	metrics   subscriberMetrics
 
 	out chan RawEvent
+
+	// seq and lastReplayID are owned by the receiver goroutine. runOnce waits
+	// for it to exit before returning, so consecutive streams never touch
+	// them concurrently.
+	seq          uint64
+	lastReplayID []byte
 
 	pendingAck atomic.Int64
 	ackWake    chan struct{}
@@ -48,12 +65,21 @@ type Subscriber struct {
 // NewSubscriber constructs a subscriber for a single topic. batchSize is the
 // number of events requested per FetchRequest (initial and replenishment).
 // batchSize is expected to be a small positive integer from config (validated
-// >= 1); values exceeding int32 are clamped.
-func NewSubscriber(client *Client, topic string, batchSize int, log *zap.Logger, reg prometheus.Registerer) *Subscriber {
+// >= 1); values exceeding int32 are clamped. cursors supplies the committed
+// replay cursor the first stream resumes from.
+func NewSubscriber(
+	client *Client,
+	topic string,
+	batchSize int,
+	cursors CursorLoader,
+	log *zap.Logger,
+	reg prometheus.Registerer,
+) *Subscriber {
 	return &Subscriber{
 		client:    client,
 		topic:     topic,
 		batchSize: int32(clampToInt32(int64(batchSize))), //nolint:gosec // clamped above to int32 range
+		cursors:   cursors,
 		log:       log.With(zap.String("topic", topic)),
 		metrics:   newSubscriberMetrics(reg),
 		out:       make(chan RawEvent, subscriberOutBuffer),
@@ -124,6 +150,11 @@ func (s *Subscriber) Run(ctx context.Context) error {
 }
 
 func (s *Subscriber) runOnce(ctx context.Context) error {
+	initial, err := s.initialFetch(ctx)
+	if err != nil {
+		return err
+	}
+
 	streamCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -135,29 +166,65 @@ func (s *Subscriber) runOnce(ctx context.Context) error {
 	s.metrics.streamOpen.WithLabelValues(s.topic).Set(1)
 	defer s.metrics.streamOpen.WithLabelValues(s.topic).Set(0)
 
-	initial := &salesforcepb.FetchRequest{
-		TopicName:    s.topic,
-		ReplayPreset: salesforcepb.ReplayPreset_LATEST,
-		NumRequested: s.batchSize,
-	}
 	if err := stream.Send(initial); err != nil {
 		return fmt.Errorf("send initial fetch: %w", err)
 	}
-	s.log.Info("subscribe stream opened", zap.Int32("batch_size", s.batchSize))
+	s.log.Info("subscribe stream opened",
+		zap.Int32("batch_size", s.batchSize),
+		zap.Stringer("replay_preset", initial.GetReplayPreset()),
+	)
 
 	senderErr := make(chan error, 1)
 	receiverErr := make(chan error, 1)
 	go func() { senderErr <- s.runSender(streamCtx, stream) }()
 	go func() { receiverErr <- s.runReceiver(streamCtx, stream) }()
 
+	// Whichever side stops first, cancel the stream and wait for the receiver:
+	// the next stream must not start while it can still emit events.
 	select {
-	case err := <-senderErr:
-		return err
-	case err := <-receiverErr:
-		return err
-	case <-ctx.Done():
+	case err = <-senderErr:
+		cancel()
+		<-receiverErr
+	case err = <-receiverErr:
+		cancel()
+		<-senderErr
+	}
+	if ctx.Err() != nil {
 		return nil
 	}
+	return err
+}
+
+// initialFetch builds the request that opens a stream.
+//
+// A reconnect resumes right after the last event this process received:
+// everything up to it is already in the pipeline and will finish or stop with
+// the process, so asking for it again would only produce duplicates. The first
+// stream has no such event and resumes from the committed cursor, falling back
+// to LATEST when the topic has never been committed.
+//
+// A failure to load the cursor is returned rather than defaulting to LATEST,
+// which would silently skip every event published while the service was down.
+func (s *Subscriber) initialFetch(ctx context.Context) (*salesforcepb.FetchRequest, error) {
+	req := &salesforcepb.FetchRequest{
+		TopicName:    s.topic,
+		ReplayPreset: salesforcepb.ReplayPreset_LATEST,
+		NumRequested: s.batchSize,
+	}
+
+	replayID := s.lastReplayID
+	if replayID == nil {
+		rid, err := s.cursors.LoadReplay(ctx, s.topic)
+		if err != nil {
+			return nil, fmt.Errorf("load replay cursor: %w", err)
+		}
+		replayID = rid
+	}
+	if replayID != nil {
+		req.ReplayPreset = salesforcepb.ReplayPreset_CUSTOM
+		req.ReplayId = replayID
+	}
+	return req, nil
 }
 
 func (s *Subscriber) runSender(ctx context.Context, stream salesforcepb.PubSub_SubscribeClient) error {
@@ -188,7 +255,9 @@ func (s *Subscriber) runReceiver(ctx context.Context, stream salesforcepb.PubSub
 			select {
 			case <-ctx.Done():
 				return nil
-			case s.out <- RawEvent{Topic: s.topic, Event: e, ReceivedAt: time.Now()}:
+			case s.out <- RawEvent{Topic: s.topic, Seq: s.seq + 1, Event: e, ReceivedAt: time.Now()}:
+				s.seq++
+				s.lastReplayID = e.GetReplayId()
 				s.metrics.eventsReceived.WithLabelValues(s.topic).Inc()
 			}
 		}
