@@ -1,8 +1,8 @@
 //go:build integration
 
 // Benchmarks the claim the dedup cache is built on: that skipping the database
-// transaction for an already-processed event is meaningfully cheaper than
-// letting Postgres reject the duplicate on its UNIQUE constraint.
+// write for an already-processed event is cheaper than letting Postgres reject
+// the duplicate on its UNIQUE constraint.
 //
 // Run with:
 //
@@ -114,7 +114,7 @@ func newPersist(b *testing.B, dsn string) handler.Handler {
 }
 
 // BenchmarkDuplicates_WithoutCache measures the current behaviour: every
-// duplicate opens a transaction that Postgres then rejects.
+// duplicate reaches Postgres, which rejects it on the UNIQUE constraint.
 func BenchmarkDuplicates_WithoutCache(b *testing.B) {
 	ctx := context.Background()
 	h := newPersist(b, startPostgres(b))

@@ -42,7 +42,8 @@ func NewPool(ctx context.Context, dsn string, maxConns int) (*pgxpool.Pool, erro
 }
 
 // Store is the high-level data-access facade for the service. It owns the
-// connection pool and composes EventRepo + ReplayRepo into atomic operations.
+// connection pool and exposes the EventRepo and ReplayRepo operations the
+// pipeline needs.
 type Store struct {
 	pool *pgxpool.Pool
 }
@@ -62,23 +63,19 @@ func (s *Store) LoadReplay(ctx context.Context, topic string) ([]byte, error) {
 	return NewReplayRepo(s.pool).Get(ctx, topic)
 }
 
-// PersistEvent upserts the decoded event and advances the topic's replay_state
-// in a single transaction. Returns inserted=false if the event was already
-// processed (idempotency on event_uuid); in that case replay_state is NOT
-// advanced — the canonical replay cursor stays with the original committer.
+// SaveReplay records replayID as the topic's committed replay cursor.
+func (s *Store) SaveReplay(ctx context.Context, topic string, replayID []byte) error {
+	return NewReplayRepo(s.pool).Set(ctx, topic, replayID)
+}
+
+// PersistEvent stores the decoded event. Returns inserted=false if the event
+// was already stored (idempotency on event_uuid), which is not an error.
+//
+// The replay cursor is deliberately not advanced here: persistence is only
+// the first stage of the pipeline, and a cursor that moved before forwarding
+// succeeded would let a restart skip an event that never reached the sink.
 func (s *Store) PersistEvent(ctx context.Context, e event.DecodedEvent) (bool, error) {
-	var inserted bool
-	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-		ok, err := NewEventRepo(tx).Upsert(ctx, e)
-		if err != nil {
-			return err
-		}
-		inserted = ok
-		if !ok {
-			return nil
-		}
-		return NewReplayRepo(tx).Set(ctx, e.Topic, e.ReplayID)
-	})
+	inserted, err := NewEventRepo(s.pool).Upsert(ctx, e)
 	if err != nil {
 		return false, fmt.Errorf("persist event: %w", err)
 	}

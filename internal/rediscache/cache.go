@@ -1,7 +1,7 @@
 // Package rediscache implements the processed-event cache backed by Redis.
 //
 // The cache answers one question: has this event already been processed end to
-// end? A hit lets the pipeline skip a database transaction that would do
+// end? A hit lets the pipeline skip a database write that would do
 // nothing. A miss — including one caused by Redis being unavailable — costs
 // only the work the service would have done anyway, so the cache is never
 // authoritative and never blocks processing.
@@ -119,7 +119,7 @@ func newCacheMetrics(reg prometheus.Registerer) cacheMetrics {
 	m := cacheMetrics{
 		hits: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "dedup_cache_hits_total",
-			Help: "Events recognised as already processed, skipping the database transaction.",
+			Help: "Events recognised as already processed, skipping the database write.",
 		}),
 		misses: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "dedup_cache_misses_total",

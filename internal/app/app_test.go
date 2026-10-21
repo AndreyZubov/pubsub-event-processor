@@ -20,7 +20,7 @@ func testConfig() *config.Config {
 		},
 		PubSub: config.PubSubConfig{
 			Endpoint: "api.pubsub.salesforce.com:7443",
-			Topics:   []string{"/event/Test__e"},
+			Topics:   []string{"/event/Test__e", "/event/Other__e"},
 		},
 		Database: config.DatabaseConfig{URL: "postgres://x@y/z", MaxConns: 20},
 		HTTP:     config.HTTPConfig{Addr: "127.0.0.1:0"},

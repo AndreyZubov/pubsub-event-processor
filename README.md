@@ -2,7 +2,7 @@
 
 > Go microservice that subscribes to Salesforce Platform Events and Change Data Capture channels over the gRPC Pub/Sub API, decodes Avro payloads, and reliably persists events to PostgreSQL with at-least-once delivery and resumable replay.
 
-**Status:** work in progress. Authentication and the gRPC client are functional; event subscription, Avro decoding, persistence, and sink forwarding are on the roadmap below.
+**Status:** work in progress. The event pipeline works end to end — subscription, Avro decoding, persistence, Kafka forwarding, and resume from a committed replay cursor. The metrics dashboard and the remaining polish items are on the [roadmap](#roadmap).
 
 ---
 
@@ -32,8 +32,9 @@ The service connects to a Salesforce org as an OAuth client, subscribes to one o
                  [ Handler chain ] <- persist, then forward
                      /         \
             [ Postgres ]    [ Kafka ]
-                  |          (optional sink)
-          [ Replay cursor ]  <- advanced in the same transaction
+                             (optional sink)
+                          |
+                [ Replay committer ] <- persists the low-water mark of finished events
 ```
 
 Cross-cutting components: OAuth token provider with cached refresh, structured zap logger, Prometheus metrics registry, environment-based config loader, graceful shutdown across all goroutines.
@@ -52,8 +53,10 @@ What works today (in `make run`):
 - **Avro schema cache** — fetched schemas are parsed once and reused; concurrent cold-start lookups for the same `schema_id` are deduplicated via `singleflight`.
 - **Avro decoder** — payload bytes are decoded into a generic `map[string]any` keyed by field name, ready for storage and downstream sinks.
 - **End-to-end event pipeline** — subscribers fan-in into a single events channel drained by a bounded worker pool, which decodes each event and runs it through a handler chain.
-- **Persistence** — decoded events are written to PostgreSQL and the topic's replay cursor advances in the same transaction. Idempotency comes from a UNIQUE constraint on the event UUID, so replay after a reconnect is a no-op rather than a duplicate.
-- **Deduplication cache** (optional, `REDIS_ENABLED`) — Redis short-circuits the database transaction for events already processed in full. A miss, including one caused by Redis being down, falls through to Postgres, which stays authoritative.
+- **Persistence** — decoded events are written to PostgreSQL. Idempotency comes from a UNIQUE constraint on the event UUID, so a redelivered event is a no-op rather than a duplicate.
+- **Resumable replay** — a per-topic replay cursor is committed once every event up to it has finished the whole pipeline. On startup each subscriber resumes from it (`ReplayPreset.CUSTOM`), so events published while the service was down are not lost; reconnects resume right after the last event received. See [Replay and resume](#replay-and-resume).
+- **Retries** — a failing schema fetch or handler stage is retried with exponential backoff until it succeeds, so a database or broker outage stalls the pipeline instead of dropping events.
+- **Deduplication cache** (optional, `REDIS_ENABLED`) — Redis short-circuits the database write for events already processed in full. A miss, including one caused by Redis being down, falls through to Postgres, which stays authoritative.
 - **Kafka sink** (optional, `KAFKA_ENABLED`) — events are published as a JSON envelope, keyed by Salesforce topic, with an idempotent producer and `acks=all`. Readiness gates on broker reachability.
 - **Admin HTTP server** exposing `/healthz`, `/readyz` (aggregates per-subsystem checks), and `/metrics`.
 - **Startup topic discovery** — for each configured topic, the service queries Salesforce for its metadata and Avro schema and logs the result.
@@ -170,7 +173,7 @@ Stop with `Ctrl+C` for a graceful shutdown.
 | 2 — Auth + gRPC | OAuth token provider, gRPC client, GetTopic / GetSchema, readiness probe | Done |
 | 3 — Subscribe + decode | Subscribe stream client, Avro schema cache, Avro decoder | Done |
 | 4 — Process + persist | Worker pool, Postgres writes, idempotency on event UUID | Done |
-| 5 — Reliability | Replay ID persistence, reconnect with resume, graceful drain | Partial — replay cursor is persisted; resuming from it on startup is pending |
+| 5 — Reliability | Replay ID persistence, reconnect with resume, graceful drain | Done |
 | 6 — Sink + observability | Kafka sink, full metrics dashboard | Kafka done; dashboard pending |
 | 7 — Polish | Integration tests with testcontainers, documentation, demo | In progress |
 
@@ -191,6 +194,7 @@ internal/
   handler/                 Handler implementations, the chain, and the dedup decorator
   kafka/                   franz-go producer, topic provisioning, metrics
   rediscache/              processed-event cache backed by Redis
+  replay/                  replay cursor tracking and periodic commit
   pubsub/                  Salesforce Pub/Sub gRPC client and Subscriber
   schema/                  Avro schema cache and decoder
 proto/salesforce/          Salesforce .proto and generated Go code
@@ -255,10 +259,12 @@ decode -> ( dedup cache ) -> [ PersistHandler ] -> [ ForwardHandler ] -> ack
               Redis               Postgres              Kafka
 ```
 
-An event is acknowledged to Salesforce only after the whole chain succeeds. A
-Kafka outage therefore leaves the event unacknowledged, Salesforce redelivers it,
-the persist step deduplicates on event UUID, and the forward step retries — the
-failing stage is the one that repeats.
+An event counts as finished only after the whole chain succeeds; until then the
+worker retries it with exponential backoff (100ms doubling up to 10s). A Kafka
+outage therefore makes the event go round again: the persist step deduplicates on
+event UUID, and the forward step retries — the failing stage is the one that
+repeats. If the process stops first, the event is still unfinished, the replay
+cursor stays below it, and the next start redelivers it.
 
 Reversing the order would publish to Kafka first and then, after a database
 failure and redelivery, publish the same record again. Kafka's idempotent
@@ -290,6 +296,40 @@ a background buffer the caller cannot observe. `acks=all` also keeps franz-go's
 idempotent producer enabled — it disables itself under weaker acks — so a retry
 after a timeout cannot write the record twice.
 
+### Replay and resume
+
+Every event carries its position in the topic's stream. Workers finish events
+out of order, so the cursor cannot follow the latest completion — a restart
+would resume after events still in flight and lose them. The replay committer
+instead tracks the highest position below which **every** event has finished,
+and writes that event's replay ID to `replay_state` once a second.
+
+- **Startup** resumes after the committed cursor, or from `LATEST` for a topic
+  that has never been committed. If the cursor cannot be loaded, the subscriber
+  retries rather than falling back to `LATEST`, which would silently skip the
+  outage.
+- **Reconnects** resume right after the last event this process received.
+  Everything up to it is already in the pipeline, so asking for it again would
+  only produce duplicates.
+- **Shutdown** stops the workers first and then flushes the cursor, so it
+  reflects everything that finished.
+
+Resuming can redeliver up to about a second of events, plus anything that was in
+flight; idempotent persistence absorbs them. It never skips one.
+
+Two cases deliberately trade completeness for progress:
+
+- **An undecodable payload** fails the same way on every attempt, and retrying it
+  would hold the cursor in place forever. It is skipped, counted in
+  `events_failed_total{stage="decode"}`, and logged at error level with its
+  replay ID.
+- **A cursor outside the retention window.** Salesforce keeps events for a
+  limited time (72 hours for high-volume platform events). After a longer
+  outage the server rejects the stored replay ID and the subscriber keeps
+  reconnecting — visible as a climbing `pubsub_reconnects_total` and
+  `pubsub_stream_open` at 0. Deleting the topic's row from `replay_state`
+  restarts it from `LATEST`, accepting the gap.
+
 ### Topic provisioning
 
 `KAFKA_CREATE_TOPIC` creates the topic at startup and is off by default. Real
@@ -306,22 +346,23 @@ Salesforce replays events after a reconnect, so duplicates are normal — and af
 a long outage they arrive in bulk. Correctness is already handled: `processed_events`
 has a UNIQUE constraint on the event UUID, so a duplicate insert does nothing.
 
-The cost is what the cache addresses. `Store.PersistEvent` wraps its work in a
-transaction, so every duplicate opens one, inserts nothing, updates nothing and
-commits. Checking Redis first ends that path before it reaches the database.
+The cost is what the cache addresses: every duplicate still costs a database
+round trip that inserts nothing. Checking Redis first ends that path before it
+reaches the database.
 
 Measured on the local containers used by the benchmark (`make bench`, 2000
 iterations each):
 
 | | ns per duplicate |
 |---|---|
-| Postgres rejects the duplicate | 412,591 |
-| Redis answers first | 141,520 |
+| Postgres rejects the duplicate | ~143,000 |
+| Redis answers first | ~133,000 |
 
-About 2.9x cheaper, saving roughly 270 µs per duplicate — so replaying 100,000
-events after an outage takes about 14s instead of 41s. Both stores are local
-containers here; with a managed database the gap widens, since the avoided call
-is the more expensive one.
+With both stores as local containers the saving is small — about 7%, since a
+duplicate insert is a single statement and costs one round trip either way. The
+cache pays off when the database is the more expensive call: a remote or managed
+instance, or one already under write load, where it also keeps a large replay
+from adding to that load.
 
 **The cache is never authoritative.** A lookup error is treated as a miss, not as
 "not seen", and processing falls through to Postgres. Redis being unavailable
@@ -445,6 +486,7 @@ Prometheus metrics exposed at `/metrics` (Go runtime metrics included by default
 | `events_processed_total` | counter | |
 | `events_failed_total` | counter | `stage` |
 | `processing_latency_seconds` | histogram | |
+| `replay_cursor_commits_total` | counter | `result` |
 | `kafka_records_produced_total` | counter | |
 | `kafka_records_failed_total` | counter | |
 | `kafka_record_bytes_total` | counter | |

@@ -20,13 +20,18 @@ import (
 	appkafka "github.com/AndreyZubov/pubsub-event-processor/internal/kafka"
 	"github.com/AndreyZubov/pubsub-event-processor/internal/pubsub"
 	"github.com/AndreyZubov/pubsub-event-processor/internal/rediscache"
+	"github.com/AndreyZubov/pubsub-event-processor/internal/replay"
 	"github.com/AndreyZubov/pubsub-event-processor/internal/schema"
 	"github.com/AndreyZubov/pubsub-event-processor/internal/storage"
 	"github.com/AndreyZubov/pubsub-event-processor/internal/worker"
 )
 
-// dbCheckTimeout bounds the readiness probe's database ping.
-const dbCheckTimeout = 3 * time.Second
+const (
+	// dbCheckTimeout bounds the readiness probe's database ping.
+	dbCheckTimeout = 3 * time.Second
+	// replayFlushTimeout bounds the final replay cursor write on shutdown.
+	replayFlushTimeout = 5 * time.Second
+)
 
 // App is the running service: wired subsystems with a shared lifecycle.
 type App struct {
@@ -36,6 +41,7 @@ type App struct {
 	cache    *schema.Cache
 	subs     []*pubsub.Subscriber
 	pool     *worker.Pool
+	cursor   *replay.Committer
 	http     *httpserver.Server
 	store    *storage.Store
 	producer *appkafka.Producer
@@ -64,11 +70,6 @@ func New(ctx context.Context, cfg *config.Config, log *zap.Logger, reg prometheu
 		reg,
 	)
 
-	subs := make([]*pubsub.Subscriber, 0, len(cfg.PubSub.Topics))
-	for _, topic := range cfg.PubSub.Topics {
-		subs = append(subs, pubsub.NewSubscriber(client, topic, cfg.Worker.FlowBatchSize, log, reg))
-	}
-
 	dbPool, err := storage.NewPool(ctx, cfg.Database.URL, cfg.Database.MaxConns)
 	if err != nil {
 		// Everything constructed so far owns a connection; release it before
@@ -77,6 +78,11 @@ func New(ctx context.Context, cfg *config.Config, log *zap.Logger, reg prometheu
 		return nil, fmt.Errorf("database pool: %w", err)
 	}
 	store := storage.NewStore(dbPool)
+
+	subs := make([]*pubsub.Subscriber, 0, len(cfg.PubSub.Topics))
+	for _, topic := range cfg.PubSub.Topics {
+		subs = append(subs, pubsub.NewSubscriber(client, topic, cfg.Worker.FlowBatchSize, store, log, reg))
+	}
 
 	checkers := map[string]health.Checker{
 		"auth":     health.NewAuthChecker(tp),
@@ -134,6 +140,7 @@ func New(ctx context.Context, cfg *config.Config, log *zap.Logger, reg prometheu
 		client:   client,
 		cache:    cache,
 		subs:     subs,
+		cursor:   replay.NewCommitter(store, replay.DefaultInterval, log, reg),
 		http:     httpserver.New(cfg.HTTP.Addr, log, checkers),
 		store:    store,
 		producer: producer,
@@ -224,7 +231,14 @@ func (a *App) Run(ctx context.Context) error {
 		close(events)
 	}()
 
-	g.Go(func() error { return a.pool.Run(gctx, events) })
+	g.Go(func() error { return a.cursor.Run(gctx) })
+	g.Go(func() error {
+		err := a.pool.Run(gctx, events)
+		// The workers have stopped, so no completion can arrive after this
+		// flush and the persisted cursor reflects everything finished.
+		a.flushReplay(ctx)
+		return err
+	})
 
 	g.Go(func() error { return a.http.Run(gctx) })
 
@@ -236,14 +250,28 @@ func (a *App) Run(ctx context.Context) error {
 	return nil
 }
 
-// ack is the worker pool's flow-control callback: it looks up the source
-// subscriber by topic and signals N events have been processed.
-func (a *App) ack(topic string, n int) {
+// ack is the worker pool's completion callback. It returns the event's slot in
+// the source subscriber's flow-control window and lets the replay cursor move
+// past it.
+func (a *App) ack(e pubsub.RawEvent) {
+	a.cursor.Done(e.Topic, e.Seq, e.Event.GetReplayId())
 	for _, sub := range a.subs {
-		if sub.Topic() == topic {
-			sub.Ack(n)
+		if sub.Topic() == e.Topic {
+			sub.Ack(1)
 			return
 		}
+	}
+}
+
+// flushReplay persists the final replay cursors. It runs after ctx is
+// canceled, so it uses a detached context with its own deadline.
+func (a *App) flushReplay(ctx context.Context) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), replayFlushTimeout)
+	defer cancel()
+	if err := a.cursor.Flush(ctx); err != nil {
+		// Not fatal: the next start resumes from an older cursor and the
+		// idempotent pipeline absorbs the redelivered events.
+		a.log.Warn("final replay cursor commit failed", zap.Error(err))
 	}
 }
 
