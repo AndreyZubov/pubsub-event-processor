@@ -252,7 +252,27 @@ func newSubscriberMetrics(reg prometheus.Registerer) subscriberMetrics {
 		),
 	}
 	if reg != nil {
-		reg.MustRegister(m.eventsReceived, m.reconnects, m.streamOpen)
+		m.eventsReceived = registerOrReuse(reg, m.eventsReceived)
+		m.reconnects = registerOrReuse(reg, m.reconnects)
+		m.streamOpen = registerOrReuse(reg, m.streamOpen)
 	}
 	return m
+}
+
+// registerOrReuse registers c, or returns the collector already registered
+// under the same descriptor. Every Subscriber exports the same topic-labelled
+// series, so the second and later subscribers must share the first one's
+// collectors instead of registering duplicates.
+func registerOrReuse[C prometheus.Collector](reg prometheus.Registerer, c C) C {
+	err := reg.Register(c)
+	if err == nil {
+		return c
+	}
+	var are prometheus.AlreadyRegisteredError
+	if errors.As(err, &are) {
+		if existing, ok := are.ExistingCollector.(C); ok {
+			return existing
+		}
+	}
+	panic(err)
 }
