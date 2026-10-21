@@ -294,3 +294,26 @@ func TestSubscriber_StopsCleanlyOnCtxCancel(t *testing.T) {
 		t.Error("Out channel should be closed after Run returns")
 	}
 }
+
+func TestNewSubscriber_SharesMetricsAcrossTopics(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	a := NewSubscriber(nil, "/event/A", 1, zap.NewNop(), reg)
+	b := NewSubscriber(nil, "/event/B", 1, zap.NewNop(), reg)
+
+	a.metrics.eventsReceived.WithLabelValues("/event/A").Inc()
+	b.metrics.eventsReceived.WithLabelValues("/event/B").Inc()
+
+	families, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	for _, f := range families {
+		if f.GetName() == "pubsub_events_received_total" {
+			if n := len(f.GetMetric()); n != 2 {
+				t.Errorf("series: got %d, want 2 (one per topic)", n)
+			}
+			return
+		}
+	}
+	t.Error("pubsub_events_received_total not registered")
+}
