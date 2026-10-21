@@ -30,18 +30,22 @@ type recordingHandler struct {
 	mu         sync.Mutex
 	received   []event.DecodedEvent
 	returnErr  error
+	failFirst  int64
 	delay      time.Duration
 	totalCalls atomic.Int64
 }
 
 func (h *recordingHandler) Handle(_ context.Context, e event.DecodedEvent) error {
-	h.totalCalls.Add(1)
+	call := h.totalCalls.Add(1)
 	if h.delay > 0 {
 		time.Sleep(h.delay)
 	}
 	h.mu.Lock()
 	h.received = append(h.received, e)
 	h.mu.Unlock()
+	if call <= h.failFirst {
+		return errors.New("transient failure")
+	}
 	return h.returnErr
 }
 
@@ -51,12 +55,10 @@ type ackRecorder struct {
 	totalN atomic.Int64
 }
 
-func (a *ackRecorder) ack(topic string, n int) {
-	a.totalN.Add(int64(n))
+func (a *ackRecorder) ack(e pubsub.RawEvent) {
+	a.totalN.Add(1)
 	a.mu.Lock()
-	for range n {
-		a.calls = append(a.calls, topic)
-	}
+	a.calls = append(a.calls, e.Topic)
 	a.mu.Unlock()
 }
 
@@ -139,25 +141,73 @@ func TestPool_ConcurrentWorkersAllProcess(t *testing.T) {
 	}
 }
 
-func TestPool_HandlerErrorDoesNotAck(t *testing.T) {
-	h := &recordingHandler{returnErr: errors.New("downstream failure")}
+func TestPool_RetriesHandlerUntilSuccess(t *testing.T) {
+	h := &recordingHandler{failFirst: 2}
 	a := &ackRecorder{}
 	p := newTestPool(t, 1, h, a.ack)
 
-	in := make(chan pubsub.RawEvent, 3)
-	for range 3 {
-		in <- buildRawEvent(t, "S1", "/event/T")
-	}
+	in := make(chan pubsub.RawEvent, 1)
+	in <- buildRawEvent(t, "S1", "/event/T")
 	close(in)
 
 	if err := p.Run(context.Background(), in); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	if got := h.totalCalls.Load(); got != 3 {
-		t.Errorf("Handle calls: got %d, want 3", got)
+		t.Errorf("Handle calls: got %d, want 3 (two failures, one success)", got)
+	}
+	if got := a.totalN.Load(); got != 1 {
+		t.Errorf("ack count: got %d, want 1", got)
+	}
+}
+
+func TestPool_AbandonedEventIsNotAcked(t *testing.T) {
+	h := &recordingHandler{returnErr: errors.New("downstream down")}
+	a := &ackRecorder{}
+	p := newTestPool(t, 1, h, a.ack)
+
+	in := make(chan pubsub.RawEvent, 1)
+	in <- buildRawEvent(t, "S1", "/event/T")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- p.Run(ctx, in) }()
+
+	time.Sleep(250 * time.Millisecond)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not exit while retrying")
+	}
+
+	if got := h.totalCalls.Load(); got < 2 {
+		t.Errorf("Handle calls: got %d, want retries", got)
 	}
 	if got := a.totalN.Load(); got != 0 {
-		t.Errorf("ack count: got %d, want 0 (handler errored)", got)
+		t.Errorf("ack count: got %d, want 0 (never succeeded)", got)
+	}
+}
+
+func TestPool_UndecodablePayloadIsSkippedAndAcked(t *testing.T) {
+	h := &recordingHandler{}
+	a := &ackRecorder{}
+	p := newTestPool(t, 1, h, a.ack)
+
+	raw := buildRawEvent(t, "S1", "/event/T")
+	raw.Event.Event.Payload = []byte{0x01} // zigzag -1: a negative string length
+	in := make(chan pubsub.RawEvent, 1)
+	in <- raw
+	close(in)
+
+	if err := p.Run(context.Background(), in); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if got := h.totalCalls.Load(); got != 0 {
+		t.Errorf("Handle calls: got %d, want 0", got)
+	}
+	if got := a.totalN.Load(); got != 1 {
+		t.Errorf("ack count: got %d, want 1 so the replay cursor can move past it", got)
 	}
 }
 

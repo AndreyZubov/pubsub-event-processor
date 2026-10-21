@@ -8,7 +8,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/testcontainers/testcontainers-go"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 	"github.com/testcontainers/testcontainers-go/wait"
@@ -157,7 +156,7 @@ func TestReplayRepo_SetThenGet(t *testing.T) {
 	}
 }
 
-func TestStore_PersistEvent_AdvancesReplay(t *testing.T) {
+func TestStore_PersistEvent_DoesNotMoveReplayCursor(t *testing.T) {
 	s := newTestStore(t)
 	e := sampleEvent("uuid-1", "/event/T")
 
@@ -173,69 +172,30 @@ func TestStore_PersistEvent_AdvancesReplay(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load replay: %v", err)
 	}
-	if string(rid) != string(e.ReplayID) {
-		t.Errorf("replay advance: got %v, want %v", rid, e.ReplayID)
+	if rid != nil {
+		t.Errorf("replay cursor must be left to the committer: got %v", rid)
 	}
 }
 
-func TestStore_PersistEvent_DuplicateDoesNotAdvanceReplay(t *testing.T) {
+func TestStore_SaveReplayThenLoad(t *testing.T) {
 	s := newTestStore(t)
-	first := sampleEvent("uuid-1", "/event/T")
-	first.ReplayID = []byte{0x01}
+	ctx := context.Background()
 
-	if _, err := s.PersistEvent(context.Background(), first); err != nil {
-		t.Fatalf("first persist: %v", err)
-	}
-
-	dup := first
-	dup.ReplayID = []byte{0xFF} // would advance, but should be ignored
-
-	inserted, err := s.PersistEvent(context.Background(), dup)
-	if err != nil {
-		t.Fatalf("dup persist: %v", err)
-	}
-	if inserted {
-		t.Error("duplicate should report inserted=false")
-	}
-
-	rid, err := s.LoadReplay(context.Background(), first.Topic)
-	if err != nil {
-		t.Fatalf("load replay: %v", err)
-	}
-	if string(rid) != string(first.ReplayID) {
-		t.Errorf("replay should stay at original: got %v, want %v", rid, first.ReplayID)
+	for _, rid := range [][]byte{{0x01}, {0x02, 0x03}} {
+		if err := s.SaveReplay(ctx, "/event/T", rid); err != nil {
+			t.Fatalf("save %v: %v", rid, err)
+		}
+		got, err := s.LoadReplay(ctx, "/event/T")
+		if err != nil {
+			t.Fatalf("load: %v", err)
+		}
+		if string(got) != string(rid) {
+			t.Errorf("cursor: got %v, want %v", got, rid)
+		}
 	}
 }
 
-func TestStore_PersistEvent_TxRollbackOnReplayError(t *testing.T) {
-	// Force the replay write to fail by using a topic name that violates a
-	// constraint we synthesize: drop the table first to simulate breakage,
-	// expecting the inserted event_uuid to NOT appear after rollback.
-	s := newTestStore(t)
-
-	_, err := s.Pool().Exec(context.Background(), `DROP TABLE replay_state`)
-	if err != nil {
-		t.Fatalf("drop: %v", err)
-	}
-
-	e := sampleEvent("uuid-rollback", "/event/T")
-	if _, err := s.PersistEvent(context.Background(), e); err == nil {
-		t.Fatal("expected error when replay_state is missing")
-	}
-
-	var count int
-	err = s.Pool().QueryRow(context.Background(),
-		`SELECT count(*) FROM processed_events WHERE event_uuid = $1`, e.EventID).Scan(&count)
-	if err != nil {
-		t.Fatalf("count: %v", err)
-	}
-	if count != 0 {
-		t.Errorf("rollback failed: processed_events still has the uuid (count=%d)", count)
-	}
-}
-
-// TestStore_TxIsolation sanity-checks that BeginFunc returns context errors.
-func TestStore_TxIsolation_CanceledContext(t *testing.T) {
+func TestStore_PersistEvent_CanceledContext(t *testing.T) {
 	s := newTestStore(t)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -256,7 +216,7 @@ func isCanceledLike(err error) bool {
 	if err == nil {
 		return false
 	}
-	for _, target := range []error{context.Canceled, context.DeadlineExceeded, pgx.ErrTxClosed} {
+	for _, target := range []error{context.Canceled, context.DeadlineExceeded} {
 		if errors.Is(err, target) {
 			return true
 		}

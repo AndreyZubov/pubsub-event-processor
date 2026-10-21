@@ -46,7 +46,7 @@ type DatabaseConfig struct {
 // RedisConfig holds settings for the deduplication cache.
 //
 // The cache is an optimisation, never a source of truth: it short-circuits the
-// database transaction for events already processed in full. Disabled by
+// database write for events already processed in full. Disabled by
 // default — the service is correct without it, only slower on large replays.
 type RedisConfig struct {
 	Enabled bool   `env:"REDIS_ENABLED" envDefault:"false"`

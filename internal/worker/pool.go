@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/hamba/avro/v2"
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
 
@@ -16,16 +17,23 @@ import (
 	"github.com/AndreyZubov/pubsub-event-processor/internal/schema"
 )
 
+const (
+	retryMinDelay = 100 * time.Millisecond
+	retryMaxDelay = 10 * time.Second
+)
+
 // Handler processes one decoded Salesforce event. A nil return acknowledges
-// the event; a non-nil error means the worker will NOT ack and the source
-// stream will eventually redeliver — relying on idempotency for safety.
+// the event; a non-nil error makes the worker retry it with backoff. Handlers
+// must therefore be idempotent: a retry repeats every stage that ran before
+// the failure.
 type Handler interface {
 	Handle(ctx context.Context, e event.DecodedEvent) error
 }
 
-// AckFn signals the source subscriber for a topic that n events have been
-// processed and the stream may replenish its flow-control window.
-type AckFn func(topic string, n int)
+// AckFn is called exactly once for every event the pool finishes: either
+// handled successfully, or skipped because its payload cannot be decoded. It
+// is not called for events abandoned when ctx is canceled.
+type AckFn func(e pubsub.RawEvent)
 
 // Pool is a bounded set of worker goroutines that all read from the same events
 // channel and dispatch into one shared Handler.
@@ -89,29 +97,41 @@ func (p *Pool) worker(ctx context.Context, in <-chan pubsub.RawEvent) {
 	}
 }
 
+// process takes one event to completion. Transient failures — fetching the
+// schema, running the handler — are retried until they succeed or ctx is
+// canceled: Salesforce redelivers only after a reconnect, so giving up would
+// lose the event, and a downstream outage should stall the pipeline rather
+// than drain it. An abandoned event is not acked, so the replay cursor stays
+// below it and a restart redelivers it.
 func (p *Pool) process(ctx context.Context, raw pubsub.RawEvent) {
 	start := time.Now()
 	schemaID := raw.Event.GetEvent().GetSchemaId()
 
-	sch, err := p.cache.Get(ctx, schemaID)
-	if err != nil {
-		p.metrics.failed.WithLabelValues("schema").Inc()
-		p.log.Warn("schema fetch failed",
-			zap.String("topic", raw.Topic),
-			zap.String("schema_id", schemaID),
-			zap.Error(err),
-		)
+	var sch avro.Schema
+	fetched := p.retry(ctx, "schema", raw, func() error {
+		var err error
+		sch, err = p.cache.Get(ctx, schemaID)
+		return err
+	})
+	if !fetched {
 		return
 	}
 
 	payload, err := schema.Decode(sch, raw.Event.GetEvent().GetPayload())
 	if err != nil {
+		// A payload that does not decode against its own schema fails the same
+		// way on every attempt, and retrying would hold the topic's replay
+		// cursor in place forever. The event is skipped instead, logged with
+		// its replay ID so it can be recovered from Salesforce by hand.
 		p.metrics.failed.WithLabelValues("decode").Inc()
-		p.log.Warn("avro decode failed",
+		p.log.Error("avro decode failed; skipping event",
 			zap.String("topic", raw.Topic),
+			zap.String("event_id", raw.Event.GetEvent().GetId()),
 			zap.String("schema_id", schemaID),
+			zap.Binary("replay_id", raw.Event.GetReplayId()),
 			zap.Error(err),
 		)
+		p.ack(raw)
 		return
 	}
 
@@ -124,19 +144,47 @@ func (p *Pool) process(ctx context.Context, raw pubsub.RawEvent) {
 		ReceivedAt: raw.ReceivedAt,
 	}
 
-	if err := p.handler.Handle(ctx, decoded); err != nil {
-		p.metrics.failed.WithLabelValues("handler").Inc()
-		p.log.Warn("handler failed",
-			zap.String("topic", raw.Topic),
-			zap.String("event_id", decoded.EventID),
-			zap.Error(err),
-		)
+	handled := p.retry(ctx, "handler", raw, func() error {
+		return p.handler.Handle(ctx, decoded)
+	})
+	if !handled {
 		return
 	}
 
 	p.metrics.processed.Inc()
 	p.metrics.duration.Observe(time.Since(start).Seconds())
-	p.ack(raw.Topic, 1)
+	p.ack(raw)
+}
+
+// retry runs fn until it returns nil, backing off exponentially between
+// attempts. It reports false if ctx was canceled before fn succeeded.
+func (p *Pool) retry(ctx context.Context, stage string, raw pubsub.RawEvent, fn func() error) bool {
+	delay := retryMinDelay
+	for attempt := 1; ; attempt++ {
+		err := fn()
+		if err == nil {
+			return true
+		}
+		if ctx.Err() != nil {
+			return false
+		}
+
+		p.metrics.failed.WithLabelValues(stage).Inc()
+		p.log.Warn(stage+" failed; retrying",
+			zap.String("topic", raw.Topic),
+			zap.String("event_id", raw.Event.GetEvent().GetId()),
+			zap.Int("attempt", attempt),
+			zap.Duration("backoff", delay),
+			zap.Error(err),
+		)
+
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(delay):
+		}
+		delay = min(delay*2, retryMaxDelay)
+	}
 }
 
 type poolMetrics struct {
@@ -154,7 +202,7 @@ func newPoolMetrics(reg prometheus.Registerer) poolMetrics {
 		failed: prometheus.NewCounterVec(
 			prometheus.CounterOpts{
 				Name: "events_failed_total",
-				Help: "Number of events that failed processing, labelled by stage.",
+				Help: "Number of failed processing attempts, labelled by stage. Retried stages count every attempt.",
 			},
 			[]string{"stage"},
 		),
