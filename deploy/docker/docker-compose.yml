@@ -9,9 +9,9 @@ services:
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: pubsub
     ports:
-      # Bound to localhost only and on 5433 to avoid colliding with a host
-      # Postgres on the default 5432 port.
-      - "127.0.0.1:5433:5432"
+      # Bound to localhost only and on 5433 by default to avoid colliding with
+      # a host Postgres on 5432; override with POSTGRES_PORT.
+      - "127.0.0.1:${POSTGRES_PORT:-5433}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -21,6 +21,38 @@ services:
       retries: 10
       start_period: 5s
     restart: unless-stopped
+
+  # Prometheus and Grafana with the bundled alert rules and dashboard, opt-in
+  # (`make up-observability`). Prometheus scrapes a processor running on the
+  # host, which is how `make run` and `make demo` start it.
+  prometheus:
+    profiles: [observability]
+    image: prom/prometheus:v3.5.0
+    container_name: pubsub-prometheus
+    volumes:
+      - ../prometheus:/etc/prometheus:ro
+    ports:
+      - "127.0.0.1:9090:9090"
+    extra_hosts:
+      # Docker Desktop resolves this name on its own; Linux needs the mapping.
+      - "host.docker.internal:host-gateway"
+
+  grafana:
+    profiles: [observability]
+    image: grafana/grafana:12.1.0
+    container_name: pubsub-grafana
+    environment:
+      # Local use only: anyone reaching the port can view the dashboards.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/pubsub-event-processor.json
+    volumes:
+      - ../grafana/provisioning:/etc/grafana/provisioning:ro
+      - ../grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      - prometheus
 
 volumes:
   postgres_data:

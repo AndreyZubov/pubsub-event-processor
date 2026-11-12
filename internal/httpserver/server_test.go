@@ -15,6 +15,12 @@ import (
 	"github.com/AndreyZubov/pubsub-event-processor/internal/health"
 )
 
+// testClient closes its connection after every response. The default client
+// keeps connections alive and may leave one the server has accepted but not yet
+// served; http.Server.Shutdown waits several seconds for such a connection,
+// which made the shutdown assertions below time out intermittently.
+var testClient = &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}
+
 func newTestServer(t *testing.T, checkers map[string]health.Checker) (*Server, net.Listener) {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -29,7 +35,7 @@ func waitReady(t *testing.T, url string) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		resp, err := http.Get(url) //nolint:noctx,gosec
+		resp, err := testClient.Get(url) //nolint:noctx,gosec
 		if err == nil {
 			_ = resp.Body.Close()
 			return
@@ -55,7 +61,7 @@ func TestServer_HealthzAndReadyzAndMetrics(t *testing.T) {
 	waitReady(t, base+"/healthz")
 
 	for _, path := range []string{"/healthz", "/readyz", "/metrics"} {
-		resp, err := http.Get(base + path) //nolint:noctx,gosec
+		resp, err := testClient.Get(base + path) //nolint:noctx,gosec
 		if err != nil {
 			t.Fatalf("GET %s: %v", path, err)
 		}

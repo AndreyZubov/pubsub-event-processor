@@ -1,0 +1,130 @@
+# Unit tests for alerts.yml: make check-alerts
+rule_files:
+  - alerts.yml
+
+evaluation_interval: 1m
+
+tests:
+  - interval: 1m
+    input_series:
+      - series: 'up{job="processor", instance="processor:8080"}'
+        values: "1 1 0 0 0 0 0 0 0 0"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: ProcessorDown
+        exp_alerts: []
+      - eval_time: 8m
+        alertname: ProcessorDown
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: processor
+              instance: processor:8080
+            exp_annotations:
+              summary: The processor has not answered metrics scrapes for 5 minutes.
+
+  # A reconnect closes the stream briefly; only a stream that stays closed fires.
+  - interval: 1m
+    input_series:
+      - series: 'pubsub_stream_open{topic="/event/Order_Event__e"}'
+        values: "1 0 1 1 0 0 0 0 0 0 0"
+      - series: 'pubsub_stream_open{topic="/event/Other__e"}'
+        values: "1 1 1 1 1 1 1 1 1 1 1"
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: SubscribeStreamDown
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: SubscribeStreamDown
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              topic: /event/Order_Event__e
+            exp_annotations:
+              summary: The Subscribe stream of /event/Order_Event__e has been closed for 5 minutes.
+              description: Events are accumulating in Salesforce and are lost once they leave the retention window; pubsub_reconnects_total shows the reason.
+
+  # Handler failures with nothing completing: a downstream outage.
+  - interval: 1m
+    input_series:
+      - series: 'events_failed_total{stage="handler"}'
+        values: "0+10x20"
+      - series: 'events_processed_total'
+        values: "100 100 100 100 100 100 100 100 100 100 100 100 100 100 100 100 100 100 100 100 100"
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: PipelineStalled
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              stage: handler
+            exp_annotations:
+              summary: Events are failing at the handler stage and none are completing.
+              description: The stage is retried until it succeeds; check the database or the Kafka brokers.
+
+  # Handler failures that the retries absorb: events still complete.
+  - interval: 1m
+    input_series:
+      - series: 'events_failed_total{stage="handler"}'
+        values: "0+1x20"
+      - series: 'events_processed_total'
+        values: "0+50x20"
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: PipelineStalled
+        exp_alerts: []
+
+  - interval: 1m
+    input_series:
+      - series: 'events_failed_total{stage="decode"}'
+        values: "0 0 0 2 2 2"
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: EventsSkippedUndecodable
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: EventsSkippedUndecodable
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              stage: decode
+            exp_annotations:
+              summary: Events were skipped in the last hour because their payload could not be decoded.
+              description: The service log has the replay ID of each skipped event at error level.
+
+  - interval: 1m
+    input_series:
+      - series: 'replay_cursor_commits_total{result="error"}'
+        values: "0+60x20"
+      - series: 'replay_cursor_commits_total{result="ok"}'
+        values: "500 500 500 500 500 500 500 500 500 500 500 500 500 500 500 500 500 500 500 500 500"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: ReplayCursorNotCommitting
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: ReplayCursorNotCommitting
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: Writes of the replay cursor have been failing for 10 minutes.
+              description: Processing continues, but a restart would redeliver everything since the last committed cursor.
+
+  - interval: 1m
+    input_series:
+      - series: 'auth_token_refresh_total{result="error"}'
+        values: "0+1x40"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: AuthTokenRefreshFailing
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: AuthTokenRefreshFailing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              result: error
+            exp_annotations:
+              summary: Salesforce OAuth token refreshes have been failing for 15 minutes.
+              description: The stream closes once the current token expires; check the External Client App credentials.

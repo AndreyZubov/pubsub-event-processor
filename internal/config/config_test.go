@@ -10,7 +10,7 @@ import (
 var allConfigEnvKeys = []string{
 	"SF_CLIENT_ID", "SF_CLIENT_SECRET", "SF_LOGIN_URL",
 	"SF_TOPICS", "PUBSUB_ENDPOINT",
-	"DATABASE_URL", "DATABASE_MAX_CONNS", "SINK_WEBHOOK_URL",
+	"DATABASE_URL", "DATABASE_MAX_CONNS", "PUBSUB_CA_FILE",
 	"WORKER_COUNT", "FLOW_BATCH_SIZE",
 	"HTTP_ADDR", "LOG_LEVEL",
 	"REDIS_ENABLED", "REDIS_ADDR", "REDIS_PASSWORD", "REDIS_DB",
@@ -91,8 +91,8 @@ func TestLoad_HappyPathDefaults(t *testing.T) {
 	if cfg.LogLevel != "info" {
 		t.Errorf("LogLevel default: got %q", cfg.LogLevel)
 	}
-	if cfg.Sink.WebhookURL != "" {
-		t.Errorf("Sink default should be empty: got %q", cfg.Sink.WebhookURL)
+	if cfg.PubSub.CAFile != "" {
+		t.Errorf("CAFile default should be empty: got %q", cfg.PubSub.CAFile)
 	}
 	if got := cfg.PubSub.Topics; len(got) != 1 || got[0] != "/event/Order_Event__e" {
 		t.Errorf("Topics parsing: got %#v", got)
@@ -119,11 +119,11 @@ func TestLoad_Overrides(t *testing.T) {
 	resetEnv(t)
 	setEnv(t, baseEnv())
 	setEnv(t, map[string]string{
-		"WORKER_COUNT":     "32",
-		"FLOW_BATCH_SIZE":  "500",
-		"HTTP_ADDR":        ":9090",
-		"LOG_LEVEL":        "debug",
-		"SINK_WEBHOOK_URL": "https://example.com/hook",
+		"WORKER_COUNT":    "32",
+		"FLOW_BATCH_SIZE": "500",
+		"HTTP_ADDR":       ":9090",
+		"LOG_LEVEL":       "debug",
+		"PUBSUB_CA_FILE":  "/etc/ssl/proxy-ca.pem",
 	})
 
 	cfg, err := Load()
@@ -142,8 +142,8 @@ func TestLoad_Overrides(t *testing.T) {
 	if cfg.LogLevel != "debug" {
 		t.Errorf("LogLevel: %q", cfg.LogLevel)
 	}
-	if cfg.Sink.WebhookURL != "https://example.com/hook" {
-		t.Errorf("WebhookURL: %q", cfg.Sink.WebhookURL)
+	if cfg.PubSub.CAFile != "/etc/ssl/proxy-ca.pem" {
+		t.Errorf("CAFile: %q", cfg.PubSub.CAFile)
 	}
 }
 
@@ -198,11 +198,6 @@ func TestLoad_Errors(t *testing.T) {
 			name:    "bad SF_LOGIN_URL",
 			env:     map[string]string{"SF_LOGIN_URL": "not-a-url"},
 			wantErr: "SF_LOGIN_URL",
-		},
-		{
-			name:    "bad SINK_WEBHOOK_URL",
-			env:     map[string]string{"SINK_WEBHOOK_URL": "://broken"},
-			wantErr: "SINK_WEBHOOK_URL",
 		},
 		{
 			name:    "redis enabled without address",

@@ -184,10 +184,10 @@ func (s *Subscriber) runOnce(ctx context.Context) error {
 	select {
 	case err = <-senderErr:
 		cancel()
-		<-receiverErr
+		<-receiverErr //nolint:errcheck // only waiting for the receiver to exit
 	case err = <-receiverErr:
 		cancel()
-		<-senderErr
+		<-senderErr //nolint:errcheck // only waiting for the sender to exit
 	}
 	if ctx.Err() != nil {
 		return nil

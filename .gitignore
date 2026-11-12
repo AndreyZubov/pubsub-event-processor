@@ -28,5 +28,5 @@ vendor/
 # Internal working docs (specs, plans, notes — not for public repo)
 docs/internal/
 
-# Claude Code local memory (personal, not for public repo)
+# Claude Code local memory (not for the public repo)
 CLAUDE.local.md

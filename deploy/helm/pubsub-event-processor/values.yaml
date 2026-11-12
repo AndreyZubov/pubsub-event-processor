@@ -62,8 +62,6 @@ config:
   workerCount: 8
   flowBatchSize: 100
   databaseMaxConns: 20
-  # -- Optional webhook sink. Empty disables it.
-  sinkWebhookUrl: ""
 
 # Deduplication cache. Optional: the service is correct without it, only slower
 # when Salesforce replays a large backlog after a reconnect. A miss — including

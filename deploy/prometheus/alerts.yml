@@ -1,0 +1,63 @@
+groups:
+  - name: pubsub-event-processor
+    rules:
+      - alert: ProcessorDown
+        expr: up{job="processor"} == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: The processor has not answered metrics scrapes for 5 minutes.
+
+      # Reconnects are normal; a stream that stays closed is not. The usual
+      # causes are expired credentials and a replay cursor older than the
+      # Salesforce retention window (see "Replay and resume" in the README).
+      - alert: SubscribeStreamDown
+        expr: pubsub_stream_open == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "The Subscribe stream of {{ $labels.topic }} has been closed for 5 minutes."
+          description: Events are accumulating in Salesforce and are lost once they leave the retention window; pubsub_reconnects_total shows the reason.
+
+      # A handler stage that keeps failing stalls the pipeline rather than
+      # dropping events, so the symptom is failures with nothing processed.
+      - alert: PipelineStalled
+        expr: >-
+          sum by (stage) (rate(events_failed_total{stage!="decode"}[5m])) > 0
+          and on () sum(rate(events_processed_total[5m])) == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Events are failing at the {{ $labels.stage }} stage and none are completing."
+          description: The stage is retried until it succeeds; check the database or the Kafka brokers.
+
+      # Undecodable events are skipped, not retried: each one is data that
+      # was not stored.
+      - alert: EventsSkippedUndecodable
+        expr: increase(events_failed_total{stage="decode"}[1h]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: Events were skipped in the last hour because their payload could not be decoded.
+          description: The service log has the replay ID of each skipped event at error level.
+
+      - alert: ReplayCursorNotCommitting
+        expr: sum(increase(replay_cursor_commits_total{result="error"}[5m])) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Writes of the replay cursor have been failing for 10 minutes.
+          description: Processing continues, but a restart would redeliver everything since the last committed cursor.
+
+      - alert: AuthTokenRefreshFailing
+        expr: increase(auth_token_refresh_total{result="error"}[15m]) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: Salesforce OAuth token refreshes have been failing for 15 minutes.
+          description: The stream closes once the current token expires; check the External Client App credentials.
