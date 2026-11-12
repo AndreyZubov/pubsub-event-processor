@@ -6,8 +6,10 @@ package pubsub
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -38,7 +40,8 @@ type Client struct {
 	log  *zap.Logger
 }
 
-// Dial constructs a Client connected to cfg.Endpoint using TLS, keepalive, and
+// Dial constructs a Client connected to cfg.Endpoint using TLS (trusting
+// cfg.CAFile instead of the system roots when it is set), keepalive, and
 // per-RPC credentials sourced from tp. The unary interceptor adds metrics,
 // logging, and retry on transient errors. The connection is established lazily
 // on first RPC.
@@ -48,12 +51,19 @@ func Dial(
 	log *zap.Logger,
 	reg prometheus.Registerer,
 ) (*Client, error) {
+	tlsCfg := &tls.Config{MinVersion: tls.VersionTLS12}
+	if cfg.CAFile != "" {
+		roots, err := loadRootCAs(cfg.CAFile)
+		if err != nil {
+			return nil, fmt.Errorf("load PUBSUB_CA_FILE: %w", err)
+		}
+		tlsCfg.RootCAs = roots
+	}
+
 	metrics := newClientMetrics(reg)
 
 	opts := []grpc.DialOption{
-		grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{
-			MinVersion: tls.VersionTLS12,
-		})),
+		grpc.WithTransportCredentials(credentials.NewTLS(tlsCfg)),
 		grpc.WithPerRPCCredentials(newPerRPCCredentials(tp)),
 		grpc.WithKeepaliveParams(keepalive.ClientParameters{
 			Time:                30 * time.Second,
@@ -68,6 +78,19 @@ func Dial(
 		return nil, fmt.Errorf("grpc new client: %w", err)
 	}
 	return newClient(conn, log), nil
+}
+
+// loadRootCAs reads a PEM bundle into a certificate pool.
+func loadRootCAs(path string) (*x509.CertPool, error) {
+	pemBytes, err := os.ReadFile(path) //nolint:gosec // path comes from operator configuration
+	if err != nil {
+		return nil, err
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(pemBytes) {
+		return nil, fmt.Errorf("no certificates found in %s", path)
+	}
+	return pool, nil
 }
 
 // newClient builds a Client around an existing connection. Used by Dial and by tests.

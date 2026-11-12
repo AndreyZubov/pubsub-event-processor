@@ -12,6 +12,9 @@ LDFLAGS := -ldflags "-X main.version=$(VERSION) -s -w"
 
 GOLANGCI_LINT_VERSION := v2.13.2
 MIGRATE_IMAGE := migrate/migrate:v4.18.1
+GOVULNCHECK_VERSION := v1.9.0
+PROMETHEUS_IMAGE ?= prom/prometheus:v3.5.0
+PROMTOOL := $(DOCKER) run --rm -v "$(CURDIR)/deploy/prometheus":/rules -w /rules --entrypoint promtool $(PROMETHEUS_IMAGE)
 COMPOSE_FILE := deploy/docker/docker-compose.yml
 
 CHART_DIR := deploy/helm/pubsub-event-processor
@@ -22,7 +25,16 @@ HELM_VALUES ?= deploy/helm/values-kind.yaml
 # Label selector addressing the processor pods only, not the bundled Postgres.
 K8S_SELECTOR := app.kubernetes.io/component=processor
 
-DATABASE_URL ?= postgres://postgres:postgres@localhost:5433/pubsub?sslmode=disable
+# Host port of the local Postgres container; change it if 5433 is taken.
+POSTGRES_PORT ?= 5433
+export POSTGRES_PORT
+DATABASE_URL ?= postgres://postgres:postgres@localhost:$(POSTGRES_PORT)/pubsub?sslmode=disable
+
+# The demo keeps its events in a database of its own, so replay cursors of the
+# fake org never mix with those of a real one.
+DEMO_DATABASE_URL := postgres://postgres:postgres@localhost:$(POSTGRES_PORT)/pubsub_demo?sslmode=disable
+DEMO_CA_FILE := $(BIN_DIR)/fakeorg-ca.pem
+DEMO_RATE ?= 20
 MIGRATIONS_DIR := migrations
 
 HAS_GOLANGCI_LINT := $(shell command -v golangci-lint 2> /dev/null)
@@ -48,7 +60,7 @@ test: ## Run unit tests with race detector
 
 .PHONY: integration-test
 integration-test: ## Run integration tests (requires Docker; uses testcontainers)
-	$(GO) test -race -count=1 -tags=integration -timeout=15m ./internal/storage/... ./internal/kafka/... ./internal/rediscache/...
+	$(GO) test -race -count=1 -tags=integration -timeout=15m ./internal/app/... ./internal/storage/... ./internal/kafka/... ./internal/rediscache/...
 
 .PHONY: bench
 bench: ## Benchmark duplicate handling with and without the dedup cache
@@ -81,6 +93,15 @@ endif
 .PHONY: tidy
 tidy: ## Run go mod tidy
 	$(GO) mod tidy
+
+.PHONY: vuln
+vuln: ## Scan dependencies and the standard library with govulncheck
+	$(GO) run golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION) ./...
+
+.PHONY: check-alerts
+check-alerts: ## Validate the Prometheus alerting rules and run their unit tests (via Docker)
+	$(PROMTOOL) check rules alerts.yml
+	$(PROMTOOL) test rules alerts_test.yml
 
 .PHONY: proto
 proto: ## Generate Go code from .proto files (Docker-based)
@@ -120,13 +141,38 @@ migrate-create: ## Create a new migration: make migrate-create name=add_foo
 up: ## Start local infrastructure (Postgres) and wait for healthchecks
 	$(DOCKER) compose -f $(COMPOSE_FILE) up -d --wait
 
+.PHONY: up-observability
+up-observability: ## Start Postgres plus Prometheus and Grafana with the bundled dashboard
+	$(DOCKER) compose -f $(COMPOSE_FILE) --profile observability up -d --wait
+
+.PHONY: demo-org
+demo-org: ## Demo, terminal 1: infrastructure, dashboard, and a fake Salesforce org emitting events
+	$(DOCKER) compose -f $(COMPOSE_FILE) --profile observability up -d --wait
+	$(DOCKER) exec pubsub-postgres dropdb -U postgres --if-exists --force pubsub_demo
+	$(DOCKER) exec pubsub-postgres createdb -U postgres pubsub_demo
+	@mkdir -p $(BIN_DIR)
+	$(GO) build -o $(BIN_DIR)/fakeorg ./cmd/fakeorg
+	./$(BIN_DIR)/fakeorg -ca-out $(DEMO_CA_FILE) -rate $(DEMO_RATE)
+
+.PHONY: demo
+demo: build ## Demo, terminal 2: the processor, subscribed to the fake org
+	@test -s $(DEMO_CA_FILE) || (echo "start 'make demo-org' in another terminal first"; exit 1)
+	SF_CLIENT_ID=demo SF_CLIENT_SECRET=demo \
+	SF_LOGIN_URL=http://127.0.0.1:8090 \
+	SF_TOPICS=/event/Order_Event__e \
+	PUBSUB_ENDPOINT=127.0.0.1:7443 \
+	PUBSUB_CA_FILE=$(DEMO_CA_FILE) \
+	DATABASE_URL="$(DEMO_DATABASE_URL)" \
+	HTTP_ADDR=:8080 \
+	  ./$(BIN)
+
 .PHONY: down
 down: ## Stop local infrastructure (keep volumes)
-	$(DOCKER) compose -f $(COMPOSE_FILE) down
+	$(DOCKER) compose -f $(COMPOSE_FILE) --profile observability down
 
 .PHONY: down-clean
 down-clean: ## Stop local infrastructure and delete volumes
-	$(DOCKER) compose -f $(COMPOSE_FILE) down -v
+	$(DOCKER) compose -f $(COMPOSE_FILE) --profile observability down -v
 
 .PHONY: logs
 logs: ## Tail logs from local infrastructure

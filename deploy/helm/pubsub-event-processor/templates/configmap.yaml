@@ -13,7 +13,6 @@ data:
   WORKER_COUNT: {{ .Values.config.workerCount | quote }}
   FLOW_BATCH_SIZE: {{ .Values.config.flowBatchSize | quote }}
   DATABASE_MAX_CONNS: {{ .Values.config.databaseMaxConns | quote }}
-  SINK_WEBHOOK_URL: {{ .Values.config.sinkWebhookUrl | quote }}
   REDIS_ENABLED: {{ .Values.redis.enabled | quote }}
 {{- if .Values.redis.enabled }}
   REDIS_ADDR: {{ include "processor.redisAddr" . | quote }}

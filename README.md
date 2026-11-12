@@ -2,7 +2,7 @@
 
 > Go microservice that subscribes to Salesforce Platform Events and Change Data Capture channels over the gRPC Pub/Sub API, decodes Avro payloads, and reliably persists events to PostgreSQL with at-least-once delivery and resumable replay.
 
-**Status:** work in progress. The event pipeline works end to end — subscription, Avro decoding, persistence, Kafka forwarding, and resume from a committed replay cursor. The metrics dashboard and the remaining polish items are on the [roadmap](#roadmap).
+**Status:** feature-complete for the planned scope. The event pipeline works end to end — subscription, Avro decoding, persistence, Kafka forwarding, and resume from a committed replay cursor — and an end-to-end test holds it to that: every event stored exactly once across a restart and a dropped stream. It ships with a Grafana dashboard, alerting rules, a Helm chart, and a [demo that needs no Salesforce org](#demo-without-salesforce).
 
 ---
 
@@ -61,8 +61,7 @@ What works today (in `make run`):
 - **Admin HTTP server** exposing `/healthz`, `/readyz` (aggregates per-subsystem checks), and `/metrics`.
 - **Startup topic discovery** — for each configured topic, the service queries Salesforce for its metadata and Avro schema and logs the result.
 - **Graceful shutdown** on `SIGINT` / `SIGTERM` with bounded drain timeouts coordinated through `errgroup`.
-
-Not yet implemented (see [Roadmap](#roadmap)).
+- **Dashboard and alerts** — a Grafana dashboard and Prometheus alerting rules with unit tests. See [Observability](#observability).
 
 ---
 
@@ -70,9 +69,9 @@ Not yet implemented (see [Roadmap](#roadmap)).
 
 ### Prerequisites
 
-- Go 1.24 or newer (the project currently builds against Go 1.26).
+- Go 1.26 or newer.
 - Docker (used for golangci-lint, proto generation, golang-migrate, and the local Postgres container).
-- A Salesforce Developer Edition org (or sandbox) with an External Client App configured for the OAuth Client Credentials flow.
+- A Salesforce Developer Edition org (or sandbox) with an External Client App configured for the OAuth Client Credentials flow. To try the service without one, skip to [Demo without Salesforce](#demo-without-salesforce).
 
 ### Configure a Salesforce External Client App
 
@@ -100,19 +99,19 @@ Copy `.env.example` to `.env` and fill in the Salesforce credentials. `.env` is 
 
 ```bash
 cp .env.example .env
-# edit .env with your Connected App credentials and topic list
+# edit .env with your External Client App credentials and topic list
 ```
 
 Required values:
 
 | Variable | Purpose |
 |----------|---------|
-| `SF_CLIENT_ID` | Connected App Consumer Key |
-| `SF_CLIENT_SECRET` | Connected App Consumer Secret |
+| `SF_CLIENT_ID` | External Client App Consumer Key |
+| `SF_CLIENT_SECRET` | External Client App Consumer Secret |
 | `SF_LOGIN_URL` | `https://login.salesforce.com` (prod) or `https://test.salesforce.com` (sandbox) |
 | `SF_TOPICS` | Comma-separated topic list, e.g. `/event/Order_Event__e` |
 | `PUBSUB_ENDPOINT` | `api.pubsub.salesforce.com:7443` |
-| `DATABASE_URL` | Postgres DSN (validated at startup; used in later milestones) |
+| `DATABASE_URL` | Postgres DSN; pending migrations are applied at startup |
 
 Optional knobs:
 
@@ -122,7 +121,8 @@ Optional knobs:
 | `FLOW_BATCH_SIZE` | `100` |
 | `HTTP_ADDR` | `:8080` |
 | `LOG_LEVEL` | `info` |
-| `SINK_WEBHOOK_URL` | _empty_ |
+| `DATABASE_MAX_CONNS` | `20` |
+| `PUBSUB_CA_FILE` | _empty_ — PEM bundle to trust instead of the system roots (TLS-inspecting proxy, local fake org) |
 | `REDIS_ENABLED` | `false` |
 | `REDIS_ADDR` | _empty_ (required when enabled) |
 | `REDIS_TTL` | `24h` |
@@ -139,7 +139,7 @@ Optional knobs:
 ### Run the service
 
 ```bash
-# Start the local Postgres container.
+# Start the local Postgres container (host port 5433; POSTGRES_PORT overrides it).
 make up
 
 # Build and run.
@@ -165,6 +165,44 @@ Stop with `Ctrl+C` for a graceful shutdown.
 
 ---
 
+## Demo without Salesforce
+
+The repository includes a fake Salesforce org: an OAuth token endpoint and a
+Pub/Sub API server that honour the parts of the protocol the service relies on —
+per-RPC credentials, pull-based flow control, and replay presets. It serves gRPC
+over TLS with a certificate generated at startup, because the service refuses to
+send access tokens over a plaintext connection.
+
+```bash
+# Terminal 1: Postgres, Prometheus, Grafana, and the fake org emitting 20 events/s.
+make demo-org            # DEMO_RATE=200 make demo-org for more load
+
+# Terminal 2: the processor, subscribed to the fake org.
+make demo
+```
+
+| What | Where |
+|------|-------|
+| Dashboard | http://localhost:3000 (opens as the Grafana home page) |
+| Prometheus and alert state | http://localhost:9090 |
+| Stored events | `docker exec pubsub-postgres psql -U postgres -d pubsub_demo -c 'SELECT count(*) FROM processed_events'` |
+
+To watch replay resume, stop the processor with `Ctrl+C`, wait a few seconds, and
+run `make demo` again. The log shows the stream opening with
+`"replay_preset":"CUSTOM"`, and the events emitted in the meantime arrive — the
+order numbers in `processed_events` stay contiguous:
+
+```bash
+docker exec pubsub-postgres psql -U postgres -d pubsub_demo -c \
+  "SELECT count(*), count(DISTINCT payload->>'Order_Number__c') FROM processed_events"
+```
+
+The demo uses a database of its own (`pubsub_demo`, recreated by `make demo-org`),
+so its replay cursors never mix with those of a real org. `make down` stops the
+containers.
+
+---
+
 ## Roadmap
 
 | Milestone | Scope | Status |
@@ -174,8 +212,12 @@ Stop with `Ctrl+C` for a graceful shutdown.
 | 3 — Subscribe + decode | Subscribe stream client, Avro schema cache, Avro decoder | Done |
 | 4 — Process + persist | Worker pool, Postgres writes, idempotency on event UUID | Done |
 | 5 — Reliability | Replay ID persistence, reconnect with resume, graceful drain | Done |
-| 6 — Sink + observability | Kafka sink, full metrics dashboard | Kafka done; dashboard pending |
-| 7 — Polish | Integration tests with testcontainers, documentation, demo | In progress |
+| 6 — Sink + observability | Kafka sink, Grafana dashboard, alerting rules | Done |
+| 7 — Tests and polish | End-to-end test against a fake org, CI, demo, documentation | Done |
+
+Possible next steps: a dead-letter table with re-drive for events that keep
+failing, partitioned consumption so the service can scale beyond one replica, and
+OpenTelemetry traces per event.
 
 ---
 
@@ -183,6 +225,7 @@ Stop with `Ctrl+C` for a graceful shutdown.
 
 ```
 cmd/processor/             entry point
+cmd/fakeorg/               fake Salesforce org for the demo
 internal/
   app/                     subsystem wiring and lifecycle
   auth/                    OAuth token provider with cache
@@ -196,12 +239,18 @@ internal/
   rediscache/              processed-event cache backed by Redis
   replay/                  replay cursor tracking and periodic commit
   pubsub/                  Salesforce Pub/Sub gRPC client and Subscriber
+  pubsub/pubsubtest/       in-process fake org: OAuth endpoint and Pub/Sub API server
   schema/                  Avro schema cache and decoder
+  storage/                 Postgres access: migrations, events, replay cursors
+  worker/                  bounded worker pool with retries
 proto/salesforce/          Salesforce .proto and generated Go code
 scripts/                   dev scripts (proto generation, git hooks)
 deploy/docker/             docker-compose, service Dockerfile
 deploy/helm/               Helm chart and local kind values
-migrations/                SQL migrations (used in milestone 4)
+deploy/prometheus/         scrape configuration, alerting rules and their tests
+deploy/grafana/            dashboard and provisioning
+migrations/                SQL migrations, embedded in the binary
+.github/workflows/         CI and CodeQL
 ```
 
 ---
@@ -215,15 +264,21 @@ make help          # list all targets
 
 make build         # compile the binary into bin/processor
 make test          # go test -race -count=1 ./...
+make integration-test  # tests against real Postgres, Kafka, and Redis (testcontainers)
 make cover         # tests with coverage report
 make lint          # golangci-lint via Docker
 make fmt           # apply gofumpt + gci import ordering
+make vuln          # govulncheck against dependencies and the standard library
+make check-alerts  # promtool: validate and unit-test the alerting rules (via Docker)
 
 make proto         # regenerate Go code from .proto (Docker-based)
 make proto-check   # CI guard: fails if generated code is out of date
 
 make up            # start local Postgres
-make down          # stop it (preserves volume)
+make up-observability  # the same plus Prometheus and Grafana
+make demo-org      # demo, terminal 1: infrastructure and the fake Salesforce org
+make demo          # demo, terminal 2: the processor, subscribed to the fake org
+make down          # stop the containers (preserves volume)
 make down-clean    # stop and delete the volume
 
 make migrate-up    # apply database migrations (requires DATABASE_URL)
@@ -232,6 +287,24 @@ make migrate-down  # revert the last migration
 make install-hooks # install the project's pre-commit hook
 make clean         # remove build artifacts
 ```
+
+### Tests
+
+Unit tests need nothing but Go. Salesforce is replaced by the in-process fake org
+in `internal/pubsub/pubsubtest`, which the real client stack talks to over TLS —
+OAuth, per-RPC credentials, and flow control included.
+
+`make integration-test` additionally starts PostgreSQL, Kafka, and Redis through
+testcontainers, so it needs Docker. `internal/app/app_integration_test.go` runs
+the whole service against the fake org and a real database and checks the
+delivery guarantee end to end: 1,500 events, with the service restarted and the
+stream dropped along the way, stored exactly once and with the committed cursor
+at the last event.
+
+CI runs lint, a `go mod tidy` cleanliness check, unit tests under the race
+detector, the integration tests, `govulncheck`, the alerting rule tests, a Helm
+lint, and a Docker image build; CodeQL analyses every push and pull request.
+Actions are pinned to commit SHAs, and Dependabot keeps them current.
 
 ### Pre-commit hook
 
@@ -495,6 +568,32 @@ Prometheus metrics exposed at `/metrics` (Go runtime metrics included by default
 | `dedup_cache_misses_total` | counter | |
 | `dedup_cache_errors_total` | counter | `op` |
 
+### Dashboard and alerts
+
+`make up-observability` starts Prometheus and Grafana next to Postgres.
+Prometheus scrapes a processor running on the host (`make run` or `make demo`),
+and Grafana opens on the bundled dashboard at http://localhost:3000: event flow
+and events in flight, processing latency percentiles, failed attempts by stage,
+replay cursor commits, stream reconnects by reason, unary RPC results, and the
+Kafka and deduplication cache panels.
+
+`deploy/prometheus/alerts.yml` holds the alerting rules; `make check-alerts`
+validates them and runs their unit tests with `promtool`.
+
+| Alert | Fires when |
+|-------|------------|
+| `ProcessorDown` | the service has not answered scrapes for 5 minutes |
+| `SubscribeStreamDown` | a topic's Subscribe stream has stayed closed for 5 minutes |
+| `PipelineStalled` | a handler stage keeps failing and no event completes |
+| `EventsSkippedUndecodable` | an event was skipped because its payload did not decode |
+| `ReplayCursorNotCommitting` | writes of the replay cursor have failed for 10 minutes |
+| `AuthTokenRefreshFailing` | OAuth token refreshes have failed for 15 minutes |
+
+For another deployment, load the same rules into that Prometheus and import
+`deploy/grafana/dashboards/pubsub-event-processor.json`.
+
+### Logs
+
 Structured JSON logs via zap, written to stdout. Every log line includes the `service` and `version` fields (the version is injected at build time from `git describe`).
 
 ---
@@ -507,4 +606,4 @@ Released under the [MIT License](LICENSE). You are free to use, modify, and dist
 
 ## Contributing
 
-This is currently a personal portfolio project. Issues and discussion are welcome via GitHub Issues. Conventional Commits are used for the history; see existing commits for examples.
+Issues and discussion are welcome via GitHub Issues. Conventional Commits are used for the history; see existing commits for examples.

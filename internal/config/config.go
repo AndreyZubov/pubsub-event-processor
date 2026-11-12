@@ -18,7 +18,6 @@ type Config struct {
 	Database   DatabaseConfig
 	Redis      RedisConfig
 	Kafka      KafkaConfig
-	Sink       SinkConfig
 	HTTP       HTTPConfig
 	Worker     WorkerConfig
 	LogLevel   string `env:"LOG_LEVEL" envDefault:"info"`
@@ -35,6 +34,10 @@ type SalesforceConfig struct {
 type PubSubConfig struct {
 	Endpoint string   `env:"PUBSUB_ENDPOINT"      envDefault:"api.pubsub.salesforce.com:7443"`
 	Topics   []string `env:"SF_TOPICS,required"   envSeparator:","`
+	// CAFile is an optional PEM bundle of root certificates to trust for the
+	// endpoint instead of the system roots. Needed behind a TLS-inspecting
+	// proxy and for the local fake org; leave empty for Salesforce itself.
+	CAFile string `env:"PUBSUB_CA_FILE"`
 }
 
 // DatabaseConfig holds the Postgres connection DSN and pool sizing.
@@ -86,11 +89,6 @@ type KafkaConfig struct {
 	// TopicReplicationFactor applies only when CreateTopic is true. A single
 	// replica is valid only for a single-broker development cluster.
 	TopicReplicationFactor int16 `env:"KAFKA_TOPIC_REPLICATION_FACTOR" envDefault:"1"`
-}
-
-// SinkConfig holds optional downstream sink settings.
-type SinkConfig struct {
-	WebhookURL string `env:"SINK_WEBHOOK_URL"`
 }
 
 // HTTPConfig holds the admin HTTP server settings (health, readiness, metrics).
@@ -185,12 +183,6 @@ func (c *Config) Validate() error {
 			if c.Kafka.TopicReplicationFactor < 1 {
 				errs = append(errs, fmt.Errorf("KAFKA_TOPIC_REPLICATION_FACTOR must be >= 1, got %d", c.Kafka.TopicReplicationFactor))
 			}
-		}
-	}
-
-	if c.Sink.WebhookURL != "" {
-		if u, err := url.Parse(c.Sink.WebhookURL); err != nil || u.Scheme == "" || u.Host == "" {
-			errs = append(errs, fmt.Errorf("SINK_WEBHOOK_URL is not a valid absolute URL: %q", c.Sink.WebhookURL))
 		}
 	}
 
